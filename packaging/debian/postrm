@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    remove)
+        deb-systemd-helper mask sederial.service >/dev/null || true
+        ;;
+    purge)
+        deb-systemd-helper purge sederial.service >/dev/null || true
+        deb-systemd-helper unmask sederial.service >/dev/null || true
+        # Retain the system identity to avoid recycling a UID still owning files.
+        ;;
+esac
+case "$1" in
+    remove|purge|disappear)
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload || true
+        fi
+        ;;
+esac

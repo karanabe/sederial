@@ -1,0 +1,74 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          test "$TAG" = "v$version"
+      - run: rustup show
+      - run: cargo fmt --check
+      - run: cargo check --locked
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: python3 scripts/check-dependencies.py
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          scripts/package.sh "${TAG#v}" "$TARGET" "target/$TARGET/release/sederial"
+          python3 scripts/verify-artifacts.py "${TAG#v}" "$TARGET" --native
+          python3 tests/standalone_smoke.py "target/$TARGET/release/sederial"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          artifacts=(sederial-x86_64-unknown-linux-gnu.tar.gz sederial-aarch64-unknown-linux-gnu.tar.gz
+                     "sederial_${version}_amd64.deb" "sederial_${version}_arm64.deb")
+          for artifact in "${artifacts[@]}"; do test -s "$artifact"; done
+          sha256sum "${artifacts[@]}" > SHA256SUMS
+          gh release create "$TAG" --verify-tag --draft --title "Sederial $TAG" --generate-notes
+          gh release upload "$TAG" "${artifacts[@]}" SHA256SUMS
+          gh release edit "$TAG" --draft=false

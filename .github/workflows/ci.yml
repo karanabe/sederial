@@ -1,0 +1,36 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - run: cargo fmt --check
+      - run: cargo check --locked
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: python3 scripts/check-dependencies.py
+      - name: Build and inspect packages
+        run: |
+          cargo build --release --locked
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          scripts/package.sh "$version" x86_64-unknown-linux-gnu target/release/sederial
+          python3 scripts/verify-artifacts.py "$version" x86_64-unknown-linux-gnu --native
+          python3 tests/standalone_smoke.py target/release/sederial
+      - name: Debian install and upgrade test
+        run: |
+          docker build -t sederial-package-test -f tests/packaging.Dockerfile .
+          docker run --rm --network none --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            -v "$PWD:/work:ro" -w /work sederial-package-test \
+            sh -c 'python3 tests/package_lifecycle.py --disposable-system dist/*_amd64.deb'
+      - name: systemd service lifecycle on disposable runner
+        run: sudo python3 tests/package_lifecycle.py --disposable-system --systemd dist/*_amd64.deb

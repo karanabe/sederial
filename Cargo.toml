@@ -1,0 +1,17 @@
+[package]
+name = "sederial"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A lightweight DNS forwarder for split-DNS environments"
+
+[dependencies]
+toml = { version = "1.1", default-features = false, features = ["parse", "std"] }
+signal-hook = { version = "0.4", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+strip = true

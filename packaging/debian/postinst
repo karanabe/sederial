@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    configure)
+        if ! getent passwd sederial >/dev/null; then
+            adduser --system --group --no-create-home --home /nonexistent \
+                --shell /usr/sbin/nologin sederial
+        fi
+        deb-systemd-helper unmask sederial.service >/dev/null || true
+        deb-systemd-helper update-state sederial.service >/dev/null || true
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload || true
+            # First installation deliberately leaves DNS disabled and stopped.
+            if [ -n "${2:-}" ]; then
+                deb-systemd-invoke try-restart sederial.service >/dev/null || true
+            fi
+        fi
+        ;;
+esac

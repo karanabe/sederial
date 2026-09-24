@@ -1,0 +1,15 @@
+# Listen on one explicit address. Use a LAN address only on a trusted network.
+# Ports default to 53. Override with IP:port or [IPv6]:port, e.g. 127.0.0.1:5300.
+listen = "127.0.0.1"
+
+[default]
+servers = ["1.1.1.1", "1.0.0.1"]
+
+# Both the exact domain and its subdomains match; longest suffix wins.
+# [[route]]
+# domain = "ad.lab.example.test"
+# servers = ["192.168.100.10"]
+#
+# [[route]]
+# domain = "100.168.192.in-addr.arpa"
+# servers = ["192.168.100.10"]
