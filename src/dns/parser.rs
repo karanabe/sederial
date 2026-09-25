@@ -80,7 +80,14 @@ impl Reader<'_> {
     fn resource_record(&mut self) -> Result<ResourceRecord, ParseError> {
         let owner = self.name()?;
         let kind = RecordType::from_wire(self.word()?);
-        let class = RecordClass::from_wire(self.word()?);
+        let class_wire = self.word()?;
+        // OPT stores the UDP payload size in the CLASS slot. Treating that
+        // number as RecordClass would make a size of 1 look like IN.
+        let class = if kind == RecordType::Opt {
+            ClassField::UdpPayload(class_wire)
+        } else {
+            ClassField::Dns(RecordClass::from_wire(class_wire))
+        };
         let ttl = self.double_word()?;
         let data_length = usize::from(self.word()?);
         let data_start = self.cursor;
@@ -95,11 +102,17 @@ impl Reader<'_> {
     }
 }
 
+/// CLASS on an ordinary record, or the UDP payload size on OPT.
+enum ClassField {
+    Dns(RecordClass),
+    UdpPayload(u16),
+}
+
 // Parsed record metadata exists only while validating the protocol boundary.
 struct ResourceRecord {
     owner: DomainName,
     kind: RecordType,
-    class: RecordClass,
+    class: ClassField,
     ttl: u32,
     data: std::ops::Range<usize>,
 }
@@ -137,6 +150,7 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
         questions.push(reader.question()?);
     }
     let mut edns = None;
+    let mut cookie = None;
     let mut authenticated = false;
     for (section, count) in header.counts.record_sections() {
         for _ in 0..count {
@@ -148,11 +162,14 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
                 {
                     return Err(ParseError::InvalidEdns);
                 }
+                let ClassField::UdpPayload(udp_size) = record.class else {
+                    return Err(ParseError::InvalidEdns);
+                };
                 validate_options(&wire[record.data.clone()])?;
-                // OPT reuses CLASS for UDP capacity and TTL for extended RCODE,
-                // version and flags; these are not ordinary class/TTL semantics.
+                cookie = super::cookie::locate(wire, record.data.start, record.data.len());
+                // OPT reuses TTL for extended RCODE, version and flags.
                 edns = Some(Edns {
-                    udp_size: record.class.wire(),
+                    udp_size,
                     version: (record.ttl >> EDNS_VERSION_SHIFT) as u8,
                     extended_rcode: (record.ttl >> EXTENDED_RCODE_SHIFT) as u8,
                     dnssec_ok: record.ttl & DO_MASK != 0,
@@ -173,6 +190,7 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
         questions,
         edns,
         authenticated,
+        cookie,
     })
 }
 
@@ -198,11 +216,14 @@ fn validate_data(wire: &[u8], record: &ResourceRecord) -> Result<(), ParseError>
         wire,
         cursor: record.data.start,
     };
+    let ClassField::Dns(class) = record.class else {
+        return Err(ParseError::InvalidRecord);
+    };
     match record.kind {
-        RecordType::A if record.class == RecordClass::In => {
+        RecordType::A if class == RecordClass::In => {
             reader.take(4)?;
         }
-        RecordType::Aaaa if record.class == RecordClass::In => {
+        RecordType::Aaaa if class == RecordClass::In => {
             reader.take(16)?;
         }
         RecordType::Ns | RecordType::Cname | RecordType::Ptr => {

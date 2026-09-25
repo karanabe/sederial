@@ -5,7 +5,10 @@
 //! attached; the request handler restores the client ID and applies size limits.
 
 use crate::{
-    dns::{MAX_MESSAGE_LENGTH, Packet, ParseError, Query, ResponseCode, TransactionId},
+    dns::{
+        MAX_MESSAGE_LENGTH, Packet, ParseError, Query, ResponseCode, ServerCookieRetry,
+        TransactionId,
+    },
     logging,
     routing::{UpstreamAddress, UpstreamGroup},
     transport::{self, Deadline, IO_POLL, Transport},
@@ -70,9 +73,11 @@ impl Forwarder {
 
     /// Tries the selected endpoints in order with a fresh ID and budget per endpoint.
     ///
-    /// UDP truncation and one retry of a reused TCP stream share the current
-    /// endpoint's deadline. SERVFAIL and exchange errors permit failover; other
-    /// correlated response codes, including NXDOMAIN and REFUSED, are final.
+    /// UDP truncation, a DNS Cookie retry, and one retry of a reused TCP stream
+    /// share the current endpoint's deadline. SERVFAIL, REFUSED and exchange
+    /// errors permit failover inside this group. BADCOOKIE retries the same
+    /// server with its new server cookie, then over TCP (RFC 7873 §5.3).
+    /// NOERROR, NXDOMAIN and every other correlated response are final.
     ///
     /// # Errors
     /// Returns the last failure when the group is exhausted. Cancellation or
@@ -85,6 +90,9 @@ impl Forwarder {
         stop: &AtomicBool,
     ) -> Result<Packet, ForwardError> {
         let mut last_error = ForwardError::Timeout;
+        // REFUSED is a real DNS answer. If nothing in the group produces a
+        // final answer, relay the latest REFUSED instead of a local SERVFAIL.
+        let mut relayed_failure = None;
         for address in upstreams.servers() {
             let deadline = Deadline::after(ATTEMPT_TIMEOUT);
             deadline.remaining(stop).map_err(ForwardError::from)?;
@@ -100,17 +108,101 @@ impl Forwarder {
                 Transport::Tcp => self.tcp_exchange(*address, &exchange),
                 Transport::Udp => self.udp_exchange(*address, &exchange),
             };
-            match result {
-                // Retry a soft server failure; a negative answer such as NXDOMAIN is final.
-                Ok(response) if response.response_code() != ResponseCode::ServerFailure => {
-                    return Ok(response);
+            let response = match result {
+                Ok(response) if response.response_code() == ResponseCode::BadCookie => {
+                    match self.finish_badcookie(*address, &exchange, response, transport) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            last_error = error;
+                            logging::warn(format_args!("upstream {address}: {last_error}"));
+                            continue;
+                        }
+                    }
                 }
-                Ok(_) => last_error = ForwardError::ServerFailure,
-                Err(error) => last_error = error,
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = error;
+                    logging::warn(format_args!("upstream {address}: {last_error}"));
+                    continue;
+                }
+            };
+            // A BADCOOKIE here already finished the cookie retry. SERVFAIL and
+            // REFUSED, including those from that retry, still advance.
+            let code = response.response_code();
+            if code == ResponseCode::BadCookie || !retries_in_group(code) {
+                return Ok(response);
+            }
+            last_error = ForwardError::from_rcode(code);
+            if code != ResponseCode::ServerFailure {
+                relayed_failure = Some(response);
             }
             logging::warn(format_args!("upstream {address}: {last_error}"));
         }
-        Err(last_error)
+        relayed_failure.ok_or(last_error)
+    }
+
+    /// RFC 7873 §5.3: retry this server with the returned server cookie, and
+    /// if that UDP retry is still BADCOOKIE, retry once over TCP. A cookie
+    /// that does not match the one we sent is discarded. The returned packet
+    /// is not necessarily final: SERVFAIL and REFUSED still fail over.
+    fn finish_badcookie(
+        &mut self,
+        address: UpstreamAddress,
+        exchange: &Exchange<'_>,
+        response: Packet,
+        transport: Transport,
+    ) -> Result<Packet, ForwardError> {
+        match exchange
+            .query
+            .server_cookie_retry(&exchange.wire, &response)
+        {
+            ServerCookieRetry::Absent | ServerCookieRetry::Leave => Ok(response),
+            ServerCookieRetry::Discard => Err(ForwardError::InvalidResponse),
+            ServerCookieRetry::Current if matches!(transport, Transport::Tcp) => Ok(response),
+            ServerCookieRetry::Current => {
+                self.resend(address, exchange, exchange.wire.clone(), Transport::Tcp)
+            }
+            ServerCookieRetry::Rewrite(wire) => {
+                let retried = self.resend(address, exchange, wire.clone(), transport)?;
+                if retried.response_code() != ResponseCode::BadCookie
+                    || matches!(transport, Transport::Tcp)
+                {
+                    return Ok(retried);
+                }
+                // The rewritten query is longer than the original slot, so the
+                // cookie location has to be read from the bytes that were sent.
+                let sent_packet = Packet::parse(&wire).map_err(ForwardError::Parse)?;
+                let tcp_wire = match sent_packet.server_cookie_retry(&wire, &retried) {
+                    ServerCookieRetry::Rewrite(wire) => wire,
+                    ServerCookieRetry::Current => wire,
+                    ServerCookieRetry::Absent | ServerCookieRetry::Leave => return Ok(retried),
+                    ServerCookieRetry::Discard => return Err(ForwardError::InvalidResponse),
+                };
+                self.resend(address, exchange, tcp_wire, Transport::Tcp)
+            }
+        }
+    }
+
+    fn resend(
+        &mut self,
+        address: UpstreamAddress,
+        exchange: &Exchange<'_>,
+        mut wire: Vec<u8>,
+        transport: Transport,
+    ) -> Result<Packet, ForwardError> {
+        let id = self.next_transaction_id()?;
+        wire[..2].copy_from_slice(&id.0.to_be_bytes());
+        let exchange = Exchange {
+            query: exchange.query,
+            id,
+            wire,
+            deadline: exchange.deadline,
+            stop: exchange.stop,
+        };
+        match transport {
+            Transport::Tcp => self.tcp_exchange(address, &exchange),
+            Transport::Udp => self.udp_exchange(address, &exchange),
+        }
     }
 
     fn next_transaction_id(&mut self) -> io::Result<TransactionId> {
@@ -238,6 +330,7 @@ pub(crate) enum ForwardError {
     Parse(ParseError),
     InvalidResponse,
     ServerFailure,
+    Refused,
 }
 impl From<io::Error> for ForwardError {
     fn from(error: io::Error) -> Self {
@@ -259,6 +352,22 @@ impl fmt::Display for ForwardError {
             Self::Parse(e) => e.fmt(f),
             Self::InvalidResponse => f.write_str("invalid or uncorrelated response"),
             Self::ServerFailure => f.write_str("upstream returned SERVFAIL"),
+            Self::Refused => f.write_str("upstream returned REFUSED"),
+        }
+    }
+}
+
+/// NOERROR and NXDOMAIN describe the name and stop the walk. SERVFAIL and
+/// REFUSED describe this server and are tried against the next one.
+fn retries_in_group(code: ResponseCode) -> bool {
+    matches!(code, ResponseCode::ServerFailure | ResponseCode::Refused)
+}
+
+impl ForwardError {
+    fn from_rcode(code: ResponseCode) -> Self {
+        match code {
+            ResponseCode::Refused => Self::Refused,
+            _ => Self::ServerFailure,
         }
     }
 }

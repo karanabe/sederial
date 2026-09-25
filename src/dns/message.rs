@@ -137,6 +137,7 @@ pub(crate) struct Packet {
     pub(super) questions: Vec<Question>,
     pub(super) edns: Option<Edns>,
     pub(super) authenticated: bool,
+    pub(super) cookie: Option<super::cookie::CookieField>,
 }
 impl Packet {
     /// Validates a complete message and retains an owned copy of its original bytes.
@@ -176,19 +177,18 @@ impl Packet {
             usize::from(opt.udp_size).clamp(super::CLASSIC_UDP_LENGTH, super::SERVER_UDP_LENGTH)
         })
     }
-    /// Borrows a supported single-question query without copying its packet.
+    /// Classifies a parsed packet as forwardable, rejectable, or silent.
     ///
-    /// # Errors
-    /// Returns the DNS rejection code for invalid flags/sections, unsupported
-    /// opcodes or EDNS versions, transfers and transaction authentication.
-    /// Response packets are also rejected; client-facing callers must discard
-    /// them before deciding to generate an error reply to avoid reflection loops.
-    pub(crate) fn validate_query(&self) -> Result<Query<'_>, ResponseCode> {
+    /// [`QueryDecision::Ignore`] is a response, or any other input that must not
+    /// produce a reply. Replying to it would reflect unsolicited traffic.
+    /// [`QueryDecision::Reject`] carries the DNS code for a malformed or
+    /// unsupported query. Only [`QueryDecision::Forward`] can reach an upstream.
+    pub(crate) fn validate_query(&self) -> QueryDecision<'_> {
         if self.header.message_type() != MessageType::Query {
-            return Err(ResponseCode::FormatError);
+            return QueryDecision::Ignore;
         }
         if self.header.opcode() != Opcode::Query {
-            return Err(ResponseCode::NotImplemented);
+            return QueryDecision::Reject(ResponseCode::NotImplemented);
         }
         if self.questions.len() != 1
             || self.header.truncated()
@@ -197,10 +197,10 @@ impl Packet {
             || self.header.counts.answers != 0
             || self.header.counts.authorities != 0
         {
-            return Err(ResponseCode::FormatError);
+            return QueryDecision::Reject(ResponseCode::FormatError);
         }
         if self.edns.is_some_and(|opt| opt.version != 0) {
-            return Err(ResponseCode::BadVersion);
+            return QueryDecision::Reject(ResponseCode::BadVersion);
         }
         let question = &self.questions[0];
         if self.authenticated
@@ -213,9 +213,9 @@ impl Packet {
                     | RecordType::Opt
             )
         {
-            return Err(ResponseCode::Refused);
+            return QueryDecision::Reject(ResponseCode::Refused);
         }
-        Ok(Query {
+        QueryDecision::Forward(Query {
             packet: self,
             question,
         })
@@ -238,8 +238,20 @@ impl Packet {
     }
 }
 
+/// Outcome of [`Packet::validate_query`].
+///
+/// The variants separate "send this upstream", "answer with this code", and
+/// "do not answer". A bare [`ResponseCode`] cannot express the last one.
+#[derive(Debug)]
+pub(crate) enum QueryDecision<'a> {
+    Forward(Query<'a>),
+    Reject(ResponseCode),
+    Ignore,
+}
+
 /// A supported single-question query borrowed from an immutable parsed packet.
-/// Only validation can construct this view, so forwarding cannot skip that step.
+/// Only [`QueryDecision::Forward`] constructs this view, so forwarding cannot
+/// skip validation.
 #[derive(Debug)]
 pub(crate) struct Query<'a> {
     packet: &'a Packet,
@@ -277,5 +289,24 @@ impl Query<'_> {
     /// Record data may be incomplete; this never authorizes forwarding that data.
     pub(crate) fn matches_truncated(&self, wire: &[u8], id: TransactionId) -> bool {
         super::parser::matches_truncated(self.packet, wire, id)
+    }
+
+    pub(crate) fn server_cookie_retry(
+        &self,
+        sent: &[u8],
+        response: &Packet,
+    ) -> super::cookie::ServerCookieRetry {
+        self.packet.server_cookie_retry(sent, response)
+    }
+}
+
+impl Packet {
+    /// `sent` must be this packet's wire, or the same bytes with only the ID changed.
+    pub(crate) fn server_cookie_retry(
+        &self,
+        sent: &[u8],
+        response: &Packet,
+    ) -> super::cookie::ServerCookieRetry {
+        super::cookie::retry(self, sent, response)
     }
 }

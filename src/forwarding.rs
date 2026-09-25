@@ -4,7 +4,7 @@
 //! and `transport`; this module returns a complete DNS message or a decision
 //! to discard the input without replying.
 use crate::{
-    dns::{Header, MessageType, Packet, ResponseCode},
+    dns::{Header, HeaderResponseCode, MessageType, Packet, QueryDecision, ResponseCode},
     logging,
     routing::RoutingTable,
     transport::Transport,
@@ -63,12 +63,13 @@ impl RequestHandler {
                 logging::warn(format_args!("malformed client packet: {error}"));
                 // Only the header is trustworthy, so do not echo a question or
                 // OPT record from a packet that failed structural validation.
-                return Some(header.error_reply(ResponseCode::FormatError));
+                return Some(header.error_reply(HeaderResponseCode::FORMAT_ERROR));
             }
         };
         let query = match packet.validate_query() {
-            Ok(query) => query,
-            Err(code) => return Some(packet.error_reply(code)),
+            QueryDecision::Forward(query) => query,
+            QueryDecision::Reject(code) => return Some(packet.error_reply(code)),
+            QueryDecision::Ignore => return None,
         };
         let selection = self.routing.select(query.name());
         let upstreams = selection.upstreams();

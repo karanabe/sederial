@@ -148,6 +148,133 @@ fn timeout_servfail_and_connection_failure_fail_over_but_nxdomain_is_final() {
     assert_eq!(read_frame(&mut stream), response(&q, 8));
 }
 
+fn query_with_client_cookie(name: &str, id: u16, client: &[u8; 8]) -> Vec<u8> {
+    let mut wire = query(name, 1, id);
+    wire[11] = 1;
+    wire.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 12, 0, 10, 0, 8]);
+    wire.extend_from_slice(client);
+    wire
+}
+
+fn badcookie_offering(query: &[u8], server: &[u8; 8]) -> Vec<u8> {
+    let mut reply = query.to_vec();
+    reply[2] |= 0x80;
+    reply[3] = 0x87;
+    let opt = question_end(&reply);
+    reply[opt + 5] = 1;
+    let rdlen = u16::from_be_bytes([reply[opt + 9], reply[opt + 10]]) + 8;
+    reply[opt + 9..opt + 11].copy_from_slice(&rdlen.to_be_bytes());
+    let option_len = u16::from_be_bytes([reply[opt + 13], reply[opt + 14]]) + 8;
+    reply[opt + 13..opt + 15].copy_from_slice(&option_len.to_be_bytes());
+    reply.extend_from_slice(server);
+    reply
+}
+
+fn has_server_cookie(query: &[u8], server: &[u8; 8]) -> bool {
+    let opt = question_end(query);
+    query.len() >= opt + 15 + 8 + 8 && query[opt + 15 + 8..].starts_with(server)
+}
+
+#[test]
+fn badcookie_retries_the_same_server_then_tcp() {
+    let server = [0x22; 8];
+    let client = [1, 2, 3, 4, 5, 6, 7, 8];
+    let upstream = Mock::new(move |q, tcp| {
+        if tcp && has_server_cookie(q, &server) {
+            vec![response(q, 4)]
+        } else if has_server_cookie(q, &server) {
+            let mut reply = q.to_vec();
+            reply[2] |= 0x80;
+            reply[3] = 0x87;
+            let opt = question_end(&reply);
+            reply[opt + 5] = 1;
+            vec![reply]
+        } else {
+            vec![badcookie_offering(q, &server)]
+        }
+    });
+    let other = Mock::new(|q, _| vec![response(q, 1)]);
+    let daemon = Daemon::start(&[upstream.address, other.address], &[]);
+    let q = query_with_client_cookie("cookie.test", 9, &client);
+    let answer = udp(daemon.address, &q);
+    assert_eq!(
+        answer[3] & 0x0f,
+        0,
+        "expected the TCP answer, got {answer:?}"
+    );
+    assert_eq!(upstream.tcp_connections.load(Ordering::Relaxed), 1);
+    assert!(other.seen.lock().unwrap().is_empty());
+    assert_eq!(upstream.seen.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn badcookie_with_a_fresh_server_cookie_is_answered_on_udp() {
+    let server = [0x33; 8];
+    let client = [8, 7, 6, 5, 4, 3, 2, 1];
+    let upstream = Mock::new(move |q, tcp| {
+        assert!(!tcp);
+        if has_server_cookie(q, &server) {
+            vec![response(q, 6)]
+        } else {
+            vec![badcookie_offering(q, &server)]
+        }
+    });
+    let other = Mock::new(|q, _| vec![response(q, 1)]);
+    let daemon = Daemon::start(&[upstream.address, other.address], &[]);
+    let q = query_with_client_cookie("retry.test", 6, &client);
+    let answer = udp(daemon.address, &q);
+    assert_eq!(&answer[..2], &q[..2]);
+    assert_eq!(answer[3] & 0x0f, 0);
+    assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    assert!(other.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn servfail_after_cookie_retry_tries_the_next_server() {
+    let server = [0x44; 8];
+    let client = [9; 8];
+    let upstream = Mock::new(move |q, tcp| {
+        assert!(!tcp);
+        if has_server_cookie(q, &server) {
+            vec![empty_response(q, 2)]
+        } else {
+            vec![badcookie_offering(q, &server)]
+        }
+    });
+    let other = Mock::new(|q, _| vec![response(q, 7)]);
+    let daemon = Daemon::start(&[upstream.address, other.address], &[]);
+    let q = query_with_client_cookie("failover.test", 7, &client);
+    assert_eq!(udp(daemon.address, &q), response(&q, 7));
+    assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    assert_eq!(other.seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn refused_fails_over_but_nxdomain_is_final() {
+    let refused = Mock::new(|q, _| vec![empty_response(q, 5)]);
+    let good = Mock::new(|q, _| vec![response(q, 4)]);
+    let daemon = Daemon::start(&[refused.address, good.address], &[]);
+    let q = query("refused.test", 1, 4);
+    assert_eq!(udp(daemon.address, &q), response(&q, 4));
+
+    let negative = Mock::new(|q, _| vec![empty_response(q, 3)]);
+    let untouched = Mock::new(|q, _| vec![response(q, 1)]);
+    let daemon = Daemon::start(&[negative.address, untouched.address], &[]);
+    assert_eq!(
+        udp(daemon.address, &query("nxdomain.test", 1, 3)),
+        empty_response(&query("nxdomain.test", 1, 3), 3)
+    );
+    assert!(untouched.seen.lock().unwrap().is_empty());
+
+    let only = Mock::new(|q, _| vec![empty_response(q, 5)]);
+    let daemon = Daemon::start(&[only.address], &[]);
+    let refused_query = query("last-refused.test", 1, 5);
+    assert_eq!(
+        udp(daemon.address, &refused_query),
+        empty_response(&refused_query, 5)
+    );
+}
+
 #[test]
 fn unavailable_upstreams_return_servfail() {
     let mock = Mock::new(|_, _| vec![]);

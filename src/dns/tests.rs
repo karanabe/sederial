@@ -1,5 +1,23 @@
-use super::types::{Opcode, RecordClass, RecordType};
+use super::types::{HeaderResponseCode, Opcode, RecordClass, RecordType};
 use super::*;
+
+fn forward(packet: &Packet) -> bool {
+    matches!(packet.validate_query(), QueryDecision::Forward(_))
+}
+
+fn forwarded_name(packet: &Packet) -> DomainName {
+    match packet.validate_query() {
+        QueryDecision::Forward(query) => query.name().clone(),
+        other => panic!("expected a forwardable query, got {other:?}"),
+    }
+}
+
+fn rejected(packet: &Packet) -> ResponseCode {
+    match packet.validate_query() {
+        QueryDecision::Reject(code) => code,
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
 
 // Independent wire vector: ID 0x1234, RD, one A/IN question for www.example.com.
 const QUERY: &[u8] = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01";
@@ -11,8 +29,7 @@ fn header_and_question_vector() {
     assert_eq!(packet.header.message_type(), MessageType::Query);
     assert_eq!(packet.header.opcode(), Opcode::Query);
     assert!(!packet.header.truncated());
-    let query = packet.validate_query().unwrap();
-    assert_eq!(*query.name(), "WWW.EXAMPLE.COM.".parse().unwrap());
+    assert_eq!(forwarded_name(&packet), "WWW.EXAMPLE.COM.".parse().unwrap());
     assert_eq!(packet.questions[0].kind, RecordType::A);
     assert_eq!(packet.questions[0].class, RecordClass::In);
     assert_eq!(packet.wire(), QUERY);
@@ -23,10 +40,7 @@ fn responses_cannot_be_used_as_validated_queries() {
     let mut response = QUERY.to_vec();
     response[2] |= 0x80;
     let packet = Packet::parse(&response).unwrap();
-    assert_eq!(
-        packet.validate_query().unwrap_err(),
-        ResponseCode::FormatError
-    );
+    assert!(matches!(packet.validate_query(), QueryDecision::Ignore));
 }
 
 #[test]
@@ -35,19 +49,13 @@ fn malformed_query_flags_and_missing_question_are_rejected() {
         let mut wire = QUERY.to_vec();
         wire[offset] |= mask;
         let packet = Packet::parse(&wire).unwrap();
-        assert_eq!(
-            packet.validate_query().unwrap_err(),
-            ResponseCode::FormatError
-        );
+        assert_eq!(rejected(&packet), ResponseCode::FormatError);
     }
 
     let mut wire = QUERY[..HEADER_LENGTH].to_vec();
     wire[5] = 0;
     let packet = Packet::parse(&wire).unwrap();
-    assert_eq!(
-        packet.validate_query().unwrap_err(),
-        ResponseCode::FormatError
-    );
+    assert_eq!(rejected(&packet), ResponseCode::FormatError);
 }
 
 #[test]
@@ -162,10 +170,7 @@ fn unknown_types_classes_opcodes_and_records_are_representable() {
     assert_eq!(packet.questions[0].kind, RecordType::Unknown(65000));
     assert_eq!(packet.questions[0].class, RecordClass::Unknown(65001));
     assert_eq!(packet.header.opcode(), Opcode::Unknown(15));
-    assert_eq!(
-        packet.validate_query().unwrap_err(),
-        ResponseCode::NotImplemented
-    );
+    assert_eq!(rejected(&packet), ResponseCode::NotImplemented);
     assert_eq!(packet.wire(), bytes);
 }
 
@@ -181,7 +186,7 @@ fn with_opt(version: u8) -> Vec<u8> {
 #[test]
 fn edns_size_options_version_and_generated_errors() {
     let packet = Packet::parse(&with_opt(0)).unwrap();
-    assert!(packet.validate_query().is_ok());
+    assert!(forward(&packet));
     assert_eq!(packet.udp_limit(), SERVER_UDP_LENGTH);
     assert_eq!(
         Packet::parse(QUERY).unwrap().udp_limit(),
@@ -191,7 +196,7 @@ fn edns_size_options_version_and_generated_errors() {
     assert_eq!(error.response_code(), ResponseCode::ServerFailure);
     assert!(error.edns.unwrap().dnssec_ok);
     let bad = Packet::parse(&with_opt(1)).unwrap();
-    assert_eq!(bad.validate_query().unwrap_err(), ResponseCode::BadVersion);
+    assert_eq!(rejected(&bad), ResponseCode::BadVersion);
     let error = Packet::parse(&bad.error_reply(ResponseCode::BadVersion)).unwrap();
     assert_eq!(error.response_code(), ResponseCode::BadVersion);
     assert_eq!(error.edns.unwrap().version, 0);
@@ -201,6 +206,18 @@ fn edns_size_options_version_and_generated_errors() {
         Packet::parse(&small).unwrap().udp_limit(),
         CLASSIC_UDP_LENGTH
     );
+    // CLASS wire values 1, 3 and 4 are IN, CH and HS. OPT must keep them as sizes.
+    for size in [1_u16, 3, 4] {
+        let mut bytes = with_opt(0);
+        bytes[QUERY.len() + 3..QUERY.len() + 5].copy_from_slice(&size.to_be_bytes());
+        assert_eq!(Packet::parse(&bytes).unwrap().edns.unwrap().udp_size, size);
+    }
+    assert_eq!(ResponseCode::from_wire(23), ResponseCode::BadCookie);
+    assert_eq!(ResponseCode::BadCookie.wire(), 23);
+    let header = Header::parse(QUERY).unwrap();
+    let reply = Packet::parse(&header.error_reply(HeaderResponseCode::FORMAT_ERROR)).unwrap();
+    assert_eq!(reply.response_code(), ResponseCode::FormatError);
+    assert!(reply.edns.is_none());
 }
 
 #[test]
@@ -238,7 +255,9 @@ fn malformed_opt_and_resource_data_rejected() {
 #[test]
 fn response_correlation_and_safe_truncation() {
     let packet = Packet::parse(QUERY).unwrap();
-    let query = packet.validate_query().unwrap();
+    let QueryDecision::Forward(query) = packet.validate_query() else {
+        panic!("expected a forwardable query");
+    };
     let bytes = query.truncated_reply(ResponseCode::NoError);
     let reply = Packet::parse(&bytes).unwrap();
     assert!(reply.header.truncated());

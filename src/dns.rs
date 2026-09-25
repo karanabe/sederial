@@ -1,10 +1,12 @@
 //! Pure protocol boundary. Opaque record data and original wire bytes stay here.
 //!
 //! [`Packet::parse`] checks structural validity; [`Packet::validate_query`]
-//! produces the supported [`Query`] view required for forwarding. Parsing a
-//! packet alone does not establish that it is a query or a correlated response.
+//! produces [`QueryDecision`]. Only [`QueryDecision::Forward`] may be relayed.
+//! [`QueryDecision::Ignore`] must not be answered. Parsing a packet alone does
+//! not establish that it is a query or a correlated response.
 //! Original bytes preserve compression offsets and unknown record data when
 //! packets cross the forwarding boundary.
+mod cookie;
 mod error;
 mod message;
 mod name;
@@ -12,10 +14,11 @@ mod parser;
 mod reply;
 mod types;
 
+pub(crate) use cookie::ServerCookieRetry;
 pub(crate) use error::ParseError;
-pub(crate) use message::{Header, Packet, Query};
+pub(crate) use message::{Header, Packet, Query, QueryDecision};
 pub(crate) use name::DomainName;
-pub(crate) use types::{MessageType, ResponseCode, TransactionId};
+pub(crate) use types::{HeaderResponseCode, MessageType, ResponseCode, TransactionId};
 
 /// Fixed DNS header size, excluding a TCP frame's two-byte length prefix.
 pub(crate) const HEADER_LENGTH: usize = 12;

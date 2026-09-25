@@ -47,6 +47,8 @@ pub(crate) enum ResponseCode {
     NotImplemented,
     Refused,
     BadVersion,
+    /// RFC 7873 BADCOOKIE (23). It does not fit in the four-bit header field.
+    BadCookie,
     Unknown(u16),
 }
 impl ResponseCode {
@@ -59,6 +61,7 @@ impl ResponseCode {
             4 => Self::NotImplemented,
             5 => Self::Refused,
             16 => Self::BadVersion,
+            23 => Self::BadCookie,
             n => Self::Unknown(n),
         }
     }
@@ -71,8 +74,23 @@ impl ResponseCode {
             Self::NotImplemented => 4,
             Self::Refused => 5,
             Self::BadVersion => 16,
+            Self::BadCookie => 23,
             Self::Unknown(n) => n,
         }
+    }
+}
+
+/// Response code that fits in the header RCODE nibble.
+///
+/// Extended codes such as BADVERS need an OPT record. A header-only reply has
+/// nowhere to put them, and masking them off would emit NOERROR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeaderResponseCode(u8);
+impl HeaderResponseCode {
+    pub(crate) const FORMAT_ERROR: Self = Self(1);
+
+    pub(super) fn as_response(self) -> ResponseCode {
+        ResponseCode::from_wire(u16::from(self.0))
     }
 }
 
