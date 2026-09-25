@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.98.1"
 description = "A lightweight DNS forwarder for split-DNS environments"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/karanabe/sederial"
 include = [
     "/src/**",
     "/tests/*.rs",

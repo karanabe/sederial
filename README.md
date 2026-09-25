@@ -8,6 +8,25 @@ Sederial is a lightweight DNS forwarder for split-DNS networks on Linux. It
 forwards UDP and TCP queries to different DNS servers by domain suffix. The
 most specific matching route wins; other queries use the default servers.
 
+## Install
+
+With Cargo:
+
+```sh
+cargo install sederial --locked
+```
+
+On Debian or Ubuntu, download the matching `.deb` from the
+[GitHub releases](https://github.com/karanabe/sederial/releases/latest), then
+install it. For amd64:
+
+```sh
+sudo apt install ./sederial_0.1.0_amd64.deb
+```
+
+Use the `_arm64.deb` file on arm64. The package installs a systemd service but
+leaves it stopped until you configure and enable it.
+
 ## Configure
 
 Create `sederial.toml`:
@@ -40,6 +59,9 @@ cargo run --locked -- --config ./sederial.toml
 
 Query it with `dig -p 5300 @127.0.0.1 host.example.test`. Stop the process with
 Ctrl+C. To run the tests, use `cargo test --locked`.
+
+After `cargo install`, replace `cargo run --locked --` with `sederial` in the
+commands above.
 
 The default configuration path for the installed binary is
 `/etc/sederial/sederial.toml`. The packaged systemd service can be started with
