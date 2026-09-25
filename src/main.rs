@@ -24,11 +24,18 @@ use std::{
 };
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    let Ok(_logger) = logging::initialize() else {
+        return ExitCode::FAILURE;
+    };
+    ExitCode::from(exit_status(run()))
+}
+
+fn exit_status(result: Result<(), String>) -> u8 {
+    match result {
+        Ok(()) => 0,
         Err(message) => {
-            let _ = writeln!(io::stderr().lock(), "ERROR {message}");
-            ExitCode::FAILURE
+            logging::error(format_args!("{message}"));
+            1
         }
     }
 }

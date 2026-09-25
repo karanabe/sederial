@@ -74,7 +74,7 @@ fn tcp_capacity_is_bounded_and_udp_stays_available() {
         .unwrap()
         .count();
     // Main/UDP receiver, one TCP listener, eight UDP and sixteen TCP workers.
-    assert!(threads <= 26, "unexpected worker count {threads}");
+    assert!(threads <= 27, "unexpected worker count {threads}");
     let q = query("capacity.test", 1, 8);
     assert_eq!(udp(daemon.address, &q), response(&q, 1));
     assert!(daemon.terminate("-TERM") < Duration::from_secs(3));
