@@ -29,11 +29,18 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
           test "$TAG" = "v$version"
       - run: rustup show
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
       - run: cargo check --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: python3 scripts/check-dependencies.py
+      - run: python3 scripts/check-dependencies.py --target "${{ matrix.target }}"
+      - name: Verify published crate contents
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo package --locked
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          python3 scripts/verify-crate.py "target/package/sederial-$version.crate" --target "$TARGET"
       - name: Build and package
         env:
           TARGET: ${{ matrix.target }}

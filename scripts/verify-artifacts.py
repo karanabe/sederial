@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+from licenses import collect
 
 parser = argparse.ArgumentParser()
 parser.add_argument("version")
@@ -38,6 +39,23 @@ with tempfile.TemporaryDirectory(prefix="sederial-artifact-") as temp:
         tar.extractall(root / "tar", filter="data")
     assert (root / "tar/sederial").read_bytes() == (deb / "usr/bin/sederial").read_bytes()
     assert (root / "tar/README.md").is_file()
+    expected = collect(args.target)
+    for directory in [deb / "usr/share/doc/sederial", root / "tar"]:
+        for name, original in expected.items():
+            actual = (directory / name).read_bytes()
+            assert actual.strip() and actual == original, f"missing or changed attribution: {name}"
+        copyright_text = (directory / "copyright").read_text()
+        assert "Copyright (c) 2026 karanabe" in copyright_text
+        assert "Permission is hereby granted" in copyright_text
+        assert "Apache License" in copyright_text
+        assert (directory / "RFC-COMPLIANCE.md").read_bytes() == Path("RFC-COMPLIANCE.md").read_bytes()
+    # Check the dependency floor against the packaged executable itself.
+    import re
+    versions = re.findall(r"Name: GLIBC_([0-9.]+)", output("readelf", "--version-info", deb / "usr/bin/sederial"))
+    floor = max(versions, key=lambda value: tuple(map(int, value.split("."))))
+    assert f"libc6 (>= {floor})" in output("dpkg-deb", "-f", package, "Depends")
+    machine = {"amd64": "Advanced Micro Devices X86-64", "arm64": "AArch64"}[arch]
+    assert machine in output("readelf", "-h", deb / "usr/bin/sederial")
     if args.native:
         assert output(deb / "usr/bin/sederial", "--version") == f"sederial {args.version}"
         subprocess.run([deb / "usr/bin/sederial", "--config", deb / "etc/sederial/sederial.toml", "--check"], check=True)

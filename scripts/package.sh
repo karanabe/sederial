@@ -22,7 +22,7 @@ esac
 if ! LC_ALL=C readelf -h "$binary" | grep -F "$machine" >/dev/null; then
     echo "Binary architecture does not match $target" >&2; exit 2
 fi
-manifest_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$root/Cargo.toml")
+manifest_version=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$root/Cargo.toml")
 if [ "$version" != "$manifest_version" ]; then
     echo "Version $version does not match Cargo.toml ($manifest_version)" >&2; exit 2
 fi
@@ -34,7 +34,8 @@ install -D -m 755 "$binary" "$pkg/usr/bin/sederial"
 install -D -m 644 "$root/packaging/sederial.toml" "$pkg/etc/sederial/sederial.toml"
 install -D -m 644 "$root/packaging/sederial.service" "$pkg/usr/lib/systemd/system/sederial.service"
 mkdir -p "$pkg/usr/share/doc/sederial" "$pkg/DEBIAN"
-install -m 644 "$root/README.md" "$pkg/usr/share/doc/sederial/"
+install -m 644 "$root/README.md" "$root/RFC-COMPLIANCE.md" "$pkg/usr/share/doc/sederial/"
+python3 "$root/scripts/licenses.py" "$target" "$pkg/usr/share/doc/sederial"
 printf '/etc/sederial/sederial.toml\n' > "$pkg/DEBIAN/conffiles"
 for script in postinst prerm postrm; do
     install -m 755 "$root/packaging/debian/$script" "$pkg/DEBIAN/$script"
@@ -64,7 +65,7 @@ dpkg-deb --root-owner-group -Zxz --build "$pkg" "$root/dist/sederial_${version}_
 archive=$stage/archive
 mkdir -p "$archive"
 install -m 755 "$binary" "$archive/sederial"
-install -m 644 "$root/README.md" "$archive/"
+cp -R "$pkg/usr/share/doc/sederial/." "$archive/"
 install -m 644 "$root/packaging/sederial.toml" "$root/packaging/sederial.service" "$archive/"
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -C "$archive" -cf - . \
     | gzip -n > "$root/dist/sederial-${target}.tar.gz"

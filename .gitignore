@@ -2,3 +2,5 @@
 /dist/
 /plans/
 *.deb
+
+__pycache__/

@@ -27,12 +27,23 @@ def exact(stream, length):
 def frame(data):
     return struct.pack("!H", len(data)) + data
 
+def reserve_endpoint():
+    # TCP TIME_WAIT and UDP ephemeral allocation use independent port spaces.
+    for _ in range(64):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            udp.bind(listener.getsockname())
+            return udp, listener
+        except OSError:
+            listener.close()
+            udp.close()
+    raise RuntimeError("no shared UDP/TCP test endpoint available")
+
 stop = threading.Event()
-mock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-mock.bind(("127.0.0.1", 0))
+mock, listener = reserve_endpoint()
 mock.settimeout(0.1)
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-listener.bind(mock.getsockname())
 listener.listen()
 listener.settimeout(0.1)
 
@@ -64,9 +75,10 @@ process = None
 try:
     with tempfile.TemporaryDirectory(prefix="sederial-release-") as directory:
         path = Path(directory) / "sederial.toml"
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            address = reservation.getsockname()
+        reserved_udp, reserved_tcp = reserve_endpoint()
+        address = reserved_tcp.getsockname()
+        reserved_udp.close()
+        reserved_tcp.close()
         path.write_text(f"listen='127.0.0.1:{address[1]}'\n[default]\nservers=['127.0.0.1:{mock.getsockname()[1]}']\n")
         process = subprocess.Popen(sys.argv[1:] + ["--config", str(path)], stderr=subprocess.PIPE)
         with selectors.DefaultSelector() as selector:
