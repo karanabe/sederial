@@ -15,6 +15,7 @@ use std::{
 };
 
 pub const WAIT: Duration = Duration::from_secs(5);
+const START_ATTEMPTS: usize = 8;
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 // UDP's ephemeral allocator does not know which ports TCP has in TIME_WAIT.
@@ -150,6 +151,27 @@ impl Daemon {
         Self::start_on("127.0.0.1:0", default, routes)
     }
     pub fn start_on(bind: &str, default: &[SocketAddr], routes: &[(&str, SocketAddr)]) -> Self {
+        for attempt in 0..START_ATTEMPTS {
+            match Self::start_once(bind, default, routes) {
+                Ok(daemon) => return daemon,
+                // Another test can claim the chosen port after its reservation
+                // is released but before the child binds both listeners.
+                Err(logs)
+                    if logs.contains("ERROR bind DNS listeners: Address already in use")
+                        && attempt + 1 < START_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(logs) => panic!("startup failed: {logs}"),
+            }
+        }
+        unreachable!()
+    }
+    fn start_once(
+        bind: &str,
+        default: &[SocketAddr],
+        routes: &[(&str, SocketAddr)],
+    ) -> Result<Self, String> {
         let reservation = reserve_endpoint(bind);
         let address = reservation.0.local_addr().unwrap();
         let directory = std::env::temp_dir().join(format!(
@@ -201,12 +223,12 @@ impl Daemon {
             logger: Some(logger),
             logs,
         };
-        assert!(
-            receiver.recv_timeout(WAIT).is_ok(),
-            "startup failed: {}",
-            daemon.logs.lock().unwrap()
-        );
-        daemon
+        if receiver.recv_timeout(WAIT).is_ok() {
+            Ok(daemon)
+        } else {
+            let logs = daemon.logs.lock().unwrap().clone();
+            Err(logs)
+        }
     }
     pub fn terminate(&mut self, signal: &str) -> Duration {
         let started = Instant::now();
