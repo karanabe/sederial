@@ -3,6 +3,59 @@ use std::{io::Write, sync::atomic::Ordering, time::Instant};
 use support::*;
 
 #[test]
+fn malformed_edns_returns_a_fresh_opt_over_both_transports() {
+    let upstream = Mock::new(|q, _| vec![response(q, 1)]);
+    let daemon = Daemon::start(&[upstream.address], &[]);
+    let base = query("edns.test", 1, 0x1234);
+    let mut malformed = base.clone();
+    edns(&mut malformed, 1232);
+    let end = malformed.len();
+    malformed[end - 2] = 2; // TLV declares two bytes, only one remains.
+    let mut duplicate = base.clone();
+    edns(&mut duplicate, 1232);
+    duplicate.extend_from_within(base.len()..);
+    duplicate[11] = 2;
+    let mut short_opt = base.clone();
+    edns(&mut short_opt, 1232);
+    short_opt.truncate(base.len() + 9);
+    let mut no_opt = base.clone();
+    no_opt.push(0); // Trailing byte, no OPT advertised.
+    let short_question = base[..base.len() - 1].to_vec();
+    for (wire, with_opt) in [
+        (malformed, true),
+        (duplicate, true),
+        (short_opt, false),
+        (no_opt, false),
+        (short_question, false),
+    ] {
+        for over_tcp in [false, true] {
+            let reply = if over_tcp {
+                let mut stream = tcp(daemon.address);
+                stream.write_all(&frame(&wire)).unwrap();
+                read_frame(&mut stream)
+            } else {
+                udp(daemon.address, &wire)
+            };
+            assert_eq!(&reply[..2], &base[..2]);
+            assert_eq!(reply[3] & 15, 1);
+            assert_eq!(&reply[6..10], &[0; 4]);
+            assert_eq!(&reply[10..12], &[0, u8::from(with_opt)]);
+            if with_opt {
+                assert_eq!(&reply[4..6], &[0, 1]);
+                assert_eq!(&reply[12..base.len()], &base[12..]);
+                assert_eq!(
+                    &reply[base.len()..],
+                    &[0, 0, 41, 4, 208, 0, 0, 128, 0, 0, 0]
+                );
+            } else {
+                assert_eq!(reply.len(), 12);
+            }
+        }
+    }
+    assert!(upstream.seen.lock().unwrap().is_empty());
+}
+
+#[test]
 fn split_dns_routes_ad_srv_reverse_and_default_over_both_transports() {
     let public = Mock::new(|q, _| vec![response(q, 1)]);
     let parent = Mock::new(|q, _| vec![response(q, 2)]);
@@ -89,19 +142,54 @@ fn truncated_udp_retries_tcp_and_respects_client_size() {
 fn edns_unknown_records_flags_and_options_survive() {
     let mock = Mock::new(|q, _| {
         let mut reply = large_response(q, 600);
-        reply[3] |= 0x30;
+        reply[3] |= 0x70;
         vec![reply]
     });
     let daemon = Daemon::start(&[mock.address], &[]);
     let mut q = query("unknown.test", 65000, 72);
     edns(&mut q, 4096);
-    q[3] |= 0x10;
+    q[3] |= 0x50;
     let actual = udp(daemon.address, &q);
     let mut expected = large_response(&q, 600);
-    expected[3] |= 0x30;
+    expected[3] |= 0x70;
     assert_eq!(actual, expected);
     let seen = mock.seen.lock().unwrap();
     assert_eq!(&seen[0][2..], &q[2..]);
+}
+
+#[test]
+fn last_dns_failure_preserves_ede_even_after_transport_failure() {
+    for codes in [[2, 5], [5, 2], [2, 2]] {
+        let first = Mock::new(move |q, _| vec![empty_response(q, codes[0])]);
+        let last = Mock::new(move |q, _| {
+            let mut reply = empty_response(q, codes[1]);
+            // An independently encoded Extended DNS Error option.
+            let opt = question_end(q);
+            reply.truncate(opt);
+            reply[11] = 1;
+            reply.extend_from_slice(&[
+                0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 8, 0, 15, 0, 4, 0, 22, b'n', b'o',
+            ]);
+            vec![reply]
+        });
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_address = closed.local_addr().unwrap();
+        drop(closed);
+        let daemon = Daemon::start(&[first.address, last.address, closed_address], &[]);
+        let mut q = query("ede.test", 1, 17);
+        edns(&mut q, 1232);
+        for over_tcp in [false, true] {
+            let reply = if over_tcp {
+                let mut stream = tcp(daemon.address);
+                stream.write_all(&frame(&q)).unwrap();
+                read_frame(&mut stream)
+            } else {
+                udp(daemon.address, &q)
+            };
+            assert_eq!(reply[3] & 15, codes[1]);
+            assert!(reply.ends_with(&[0, 15, 0, 4, 0, 22, b'n', b'o']));
+        }
+    }
 }
 
 #[test]
@@ -241,10 +329,10 @@ fn servfail_after_cookie_retry_tries_the_next_server() {
             vec![badcookie_offering(q, &server)]
         }
     });
-    let other = Mock::new(|q, _| vec![response(q, 7)]);
+    let other = Mock::new(|q, _| vec![cookie_response(q, 0, false)]);
     let daemon = Daemon::start(&[upstream.address, other.address], &[]);
     let q = query_with_client_cookie("failover.test", 7, &client);
-    assert_eq!(udp(daemon.address, &q), response(&q, 7));
+    assert_eq!(udp(daemon.address, &q), cookie_response(&q, 0, false));
     assert_eq!(upstream.seen.lock().unwrap().len(), 2);
     assert_eq!(other.seen.lock().unwrap().len(), 1);
 }
@@ -350,4 +438,232 @@ fn udp_ceiling_truncates_large_edns_answer_but_tcp_keeps_it() {
     let mut stream = tcp(daemon.address);
     stream.write_all(&frame(&q)).unwrap();
     assert_eq!(read_frame(&mut stream), large_response(&q, 1300));
+}
+
+// Returns a valid response COOKIE, replacing only the independently known OPT.
+fn cookie_response(q: &[u8], code: u8, large: bool) -> Vec<u8> {
+    let client = &q[question_end(q) + 15..question_end(q) + 23];
+    let mut reply = if large {
+        large_response(q, 1300)
+    } else {
+        empty_response(q, code & 15)
+    };
+    let opt = if large {
+        question_end(q) + 12 + 1300
+    } else {
+        question_end(q)
+    };
+    reply.truncate(opt);
+    reply[3] = 0x80 | (code & 15);
+    reply[11] = 1;
+    reply.extend_from_slice(&[0, 0, 41, 4, 208, code >> 4, 0, 0, 0, 0, 20, 0, 10, 0, 16]);
+    reply.extend_from_slice(client);
+    reply.extend_from_slice(&[0x55; 8]);
+    reply
+}
+
+#[test]
+fn every_udp_rcode_checks_cookie_before_accepting_the_response() {
+    for code in [0, 2, 5, 23] {
+        let upstream = Mock::new(move |q, over_tcp| {
+            let valid = cookie_response(q, code, false);
+            if over_tcp {
+                return vec![valid];
+            }
+            let mut mismatch = valid.clone();
+            mismatch[question_end(q) + 15] ^= 1;
+            let mut short = valid.clone();
+            let opt = question_end(q);
+            short[opt + 10] = 12;
+            short[opt + 14] = 8;
+            short.truncate(opt + 23);
+            vec![mismatch, short, valid]
+        });
+        let daemon = Daemon::start(&[upstream.address], &[]);
+        let q = query_with_client_cookie("correlate.test", 37, &[4; 8]);
+        assert_eq!(udp(daemon.address, &q), cookie_response(&q, code, false));
+    }
+}
+
+#[test]
+fn local_tc_retains_the_validated_response_cookie() {
+    let upstream = Mock::new(|q, _| vec![cookie_response(q, 0, true)]);
+    let daemon = Daemon::start(&[upstream.address], &[]);
+    let q = query_with_client_cookie("cookie-large.test", 38, &[7; 8]);
+    let reply = udp(daemon.address, &q);
+    assert_ne!(
+        reply[2] & 2,
+        0,
+        "reply={reply:?}, logs={:?}",
+        daemon.logs.lock().unwrap()
+    );
+    assert_eq!(&reply[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(
+        &reply[question_end(&q)..],
+        &cookie_response(&q, 0, false)[question_end(&q)..]
+    );
+}
+
+#[test]
+fn cookie_before_padding_unknown_option_or_additional_rr_uses_tcp_without_moving_bytes() {
+    for suffix in [0, 1, 2] {
+        let upstream =
+            Mock::new(|q, over_tcp| vec![cookie_response(q, if over_tcp { 0 } else { 23 }, false)]);
+        let public = Mock::new(|q, _| vec![response(q, 1)]);
+        let daemon = Daemon::start(&[public.address], &[("private.test", upstream.address)]);
+        let mut q = query_with_client_cookie("private.test", 39, &[6; 8]);
+        let opt = question_end(&q);
+        if suffix < 2 {
+            q[opt + 10] += 5;
+            q.extend_from_slice(&[
+                if suffix == 0 { 0 } else { 253 },
+                if suffix == 0 { 12 } else { 232 },
+                0,
+                1,
+                0,
+            ]);
+        } else {
+            q[11] = 2;
+            // Opaque data contains a pointer-looking byte sequence; never relocate it.
+            q.extend_from_slice(&[0xc0, 12, 253, 232, 0, 1, 0, 0, 0, 0, 0, 2, 0xc0, 12]);
+        }
+        let reply = udp(daemon.address, &q);
+        assert_eq!(reply[3] & 15, 0);
+        assert_eq!(upstream.tcp_connections.load(Ordering::Relaxed), 1);
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(&seen[1][2..], &q[2..]);
+        assert!(public.seen.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cookie_validation_covers_initial_and_retried_tcp_and_udp_responses() {
+    for phase in [
+        "initial-udp",
+        "initial-tcp",
+        "udp-retry",
+        "tcp-retry",
+        "tcp-after-udp",
+    ] {
+        for invalid in ["mismatch", "short", "missing"] {
+            if invalid == "missing" && phase.starts_with("initial") {
+                continue;
+            }
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let upstream = Mock::new(move |q, over_tcp| {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                let challenge = match phase {
+                    "udp-retry" | "tcp-retry" => call == 0,
+                    "tcp-after-udp" => call < 2,
+                    _ => false,
+                };
+                if challenge {
+                    return vec![cookie_response(q, 23, false)];
+                }
+                let valid = cookie_response(q, 0, false);
+                let mut bad = valid.clone();
+                let opt = question_end(q);
+                match invalid {
+                    "mismatch" => bad[opt + 15] ^= 1,
+                    "short" => {
+                        bad[opt + 10] = 12;
+                        bad[opt + 14] = 8;
+                        bad.truncate(opt + 23);
+                    }
+                    _ => {
+                        bad[opt + 10] = 0;
+                        bad.truncate(opt + 11);
+                    }
+                }
+                if over_tcp {
+                    vec![bad]
+                } else {
+                    vec![bad, valid]
+                }
+            });
+            let public = Mock::new(|q, _| vec![response(q, 1)]);
+            let daemon = Daemon::start(&[public.address], &[("private.test", upstream.address)]);
+            let q = query_with_client_cookie("private.test", 52, &[8; 8]);
+            let client_tcp = matches!(phase, "initial-tcp" | "tcp-retry");
+            let actual = if client_tcp {
+                let mut stream = tcp(daemon.address);
+                stream.write_all(&frame(&q)).unwrap();
+                read_frame(&mut stream)
+            } else {
+                udp(daemon.address, &q)
+            };
+            let expected_code = if phase.contains("tcp") { 2 } else { 0 };
+            assert_eq!(actual[3] & 15, expected_code, "{phase} {invalid}");
+            if expected_code == 0 {
+                assert_eq!(actual, cookie_response(&q, 0, false));
+            }
+            assert!(public.seen.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn cookie_unaware_servers_remain_compatible_on_the_first_exchange() {
+    let upstream = Mock::new(|q, _| {
+        let mut reply = empty_response(q, 0);
+        reply.truncate(question_end(q));
+        reply[11] = 0;
+        vec![reply]
+    });
+    let daemon = Daemon::start(&[upstream.address], &[]);
+    for server_cookie in [false, true] {
+        let mut q = query_with_client_cookie("legacy.test", 53, &[3; 8]);
+        if server_cookie {
+            let opt = question_end(&q);
+            q[opt + 10] = 20;
+            q[opt + 14] = 16;
+            q.extend_from_slice(&[9; 8]);
+        }
+        assert_eq!(udp(daemon.address, &q)[3] & 15, 0);
+        let mut stream = tcp(daemon.address);
+        stream.write_all(&frame(&q)).unwrap();
+        assert_eq!(read_frame(&mut stream)[3] & 15, 0);
+    }
+}
+
+#[test]
+fn private_route_failures_never_contact_default_over_udp_or_tcp() {
+    for failure in [
+        "timeout",
+        "servfail",
+        "refused",
+        "badcookie",
+        "malformed",
+        "reconnect",
+    ] {
+        let upstream = Mock::new(move |q, _| match failure {
+            "timeout" => vec![],
+            "servfail" => vec![empty_response(q, 2)],
+            "refused" => vec![empty_response(q, 5)],
+            "badcookie" => vec![cookie_response(q, 23, false)],
+            "malformed" => vec![vec![0; 3]],
+            _ => vec![response(q, 9)],
+        });
+        let public = Mock::new(|q, _| vec![response(q, 1)]);
+        let daemon = Daemon::start(&[public.address], &[("private.test", upstream.address)]);
+        let q = if failure == "badcookie" {
+            query_with_client_cookie("private.test", 54, &[8; 8])
+        } else {
+            query("private.test", 1, 54)
+        };
+        let answer = udp(daemon.address, &q);
+        assert_eq!(&answer[..2], &q[..2]);
+        let mut stream = tcp(daemon.address);
+        stream.write_all(&frame(&q)).unwrap();
+        read_frame(&mut stream);
+        if failure == "reconnect" {
+            // Mock closes idle TCP in 100 ms; the worker retains it for 2 s.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            stream.write_all(&frame(&q)).unwrap();
+            assert_eq!(read_frame(&mut stream), response(&q, 9));
+            assert!(upstream.tcp_connections.load(Ordering::Relaxed) >= 2);
+        }
+        assert!(public.seen.lock().unwrap().is_empty(), "{failure}");
+    }
 }

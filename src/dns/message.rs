@@ -11,7 +11,6 @@ pub(super) const OPCODE_SHIFT: u32 = 11;
 pub(super) const TC_MASK: u16 = 0x0200;
 pub(super) const RD_MASK: u16 = 0x0100;
 pub(super) const RA_MASK: u16 = 0x0080;
-pub(super) const RESERVED_MASK: u16 = 0x0040;
 pub(super) const CD_MASK: u16 = 0x0010;
 pub(super) const RCODE_MASK: u16 = 0x000f;
 pub(super) const DO_MASK: u32 = 0x8000;
@@ -130,7 +129,7 @@ pub(super) struct Edns {
 
 /// Owns immutable original wire bytes and the decoded fields needed by policy.
 /// Resource data is validated within the parser; it is never interpreted by routing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Packet {
     pub(super) wire: Vec<u8>,
     pub(super) header: Header,
@@ -147,6 +146,9 @@ impl Packet {
     /// malformed names/records/OPT data and trailing bytes. Successful parsing
     /// does not imply that query policy or response correlation has passed.
     pub(crate) fn parse(wire: &[u8]) -> Result<Self, ParseError> {
+        Self::parse_for_reply(wire).map_err(|failure| failure.error)
+    }
+    pub(crate) fn parse_for_reply(wire: &[u8]) -> Result<Self, super::error::ParseFailure> {
         super::parser::parse(wire)
     }
     pub(crate) fn wire(&self) -> &[u8] {
@@ -192,11 +194,13 @@ impl Packet {
         }
         if self.questions.len() != 1
             || self.header.truncated()
-            || self.header.flags & RESERVED_MASK != 0
             || self.response_code() != ResponseCode::NoError
             || self.header.counts.answers != 0
             || self.header.counts.authorities != 0
         {
+            return QueryDecision::Reject(ResponseCode::FormatError);
+        }
+        if matches!(self.cookie, Some(super::cookie::CookieField::Malformed)) {
             return QueryDecision::Reject(ResponseCode::FormatError);
         }
         if self.edns.is_some_and(|opt| opt.version != 0) {
@@ -230,7 +234,6 @@ impl Packet {
         self.header.message_type() == MessageType::Response
             && self.header.id == expected
             && self.header.opcode() == query.header.opcode()
-            && self.header.flags & RESERVED_MASK == 0
             && self.questions == query.questions
             && self.edns.is_none_or(|opt| opt.version == 0)
             && (query.edns.is_some() || self.edns.is_none())
@@ -276,37 +279,84 @@ impl Query<'_> {
         self.packet.udp_limit()
     }
 
-    pub(crate) fn error_reply(&self, code: ResponseCode) -> Vec<u8> {
-        self.packet.error_reply(code)
+    pub(crate) fn error_reply(&self, code: ResponseCode) -> Option<Vec<u8>> {
+        self.packet.local_error_reply(code)
     }
 
-    pub(crate) fn truncated_reply(&self, code: ResponseCode) -> Vec<u8> {
-        self.packet.truncated_reply(code)
+    pub(crate) fn truncated_reply(&self, response: &Response) -> Vec<u8> {
+        self.packet.truncated_reply(response)
     }
 
-    /// Checks whether a TC response's header and question authorize TCP fallback.
-    ///
-    /// Record data may be incomplete; this never authorizes forwarding that data.
-    pub(crate) fn matches_truncated(&self, wire: &[u8], id: TransactionId) -> bool {
-        super::parser::matches_truncated(self.packet, wire, id)
-    }
-
-    pub(crate) fn server_cookie_retry(
-        &self,
-        sent: &[u8],
-        response: &Packet,
-    ) -> super::cookie::ServerCookieRetry {
-        self.packet.server_cookie_retry(sent, response)
+    pub(crate) fn sent(&self, id: TransactionId) -> SentQuery {
+        let mut packet = self.packet.clone();
+        packet.header.id = id;
+        packet.wire = self.with_id(id);
+        SentQuery {
+            packet,
+            cookie_required: false,
+        }
     }
 }
 
-impl Packet {
-    /// `sent` must be this packet's wire, or the same bytes with only the ID changed.
+/// The exact outgoing bytes and their metadata travel together, including retries.
+#[derive(Debug)]
+pub(crate) struct SentQuery {
+    packet: Packet,
+    cookie_required: bool,
+}
+
+impl SentQuery {
+    pub(crate) fn wire(&self) -> &[u8] {
+        self.packet.wire()
+    }
+
+    pub(crate) fn matches_truncated(&self, wire: &[u8]) -> bool {
+        super::parser::matches_truncated(&self.packet, wire, self.packet.header.id)
+    }
+
+    pub(crate) fn validate_response(&self, response: Packet) -> Option<Response> {
+        let QueryDecision::Forward(query) = self.packet.validate_query() else {
+            return None;
+        };
+        if response.is_truncated()
+            || !response.corresponds_to(&query, self.packet.header.id)
+            || !super::cookie::valid_response(&self.packet, &response, self.cookie_required)
+        {
+            return None;
+        }
+        Some(Response(response))
+    }
+
     pub(crate) fn server_cookie_retry(
         &self,
-        sent: &[u8],
-        response: &Packet,
+        response: &Response,
     ) -> super::cookie::ServerCookieRetry {
-        super::cookie::retry(self, sent, response)
+        super::cookie::retry(&self.packet, &response.0)
+    }
+
+    /// A retry requires COOKIE after this endpoint has demonstrated support.
+    /// Reparse modified bytes here; old offsets cannot accompany the new wire.
+    pub(crate) fn retry(&self, mut wire: Vec<u8>, id: TransactionId) -> Result<Self, ParseError> {
+        wire[..2].copy_from_slice(&id.0.to_be_bytes());
+        let packet = Packet::parse(&wire)?;
+        Ok(Self {
+            packet,
+            cookie_required: true,
+        })
+    }
+}
+
+/// A complete response correlated to the actual outgoing query, including COOKIE.
+#[derive(Debug)]
+pub(crate) struct Response(pub(super) Packet);
+impl Response {
+    pub(crate) fn wire(&self) -> &[u8] {
+        self.0.wire()
+    }
+    pub(crate) fn response_code(&self) -> ResponseCode {
+        self.0.response_code()
+    }
+    pub(crate) fn with_id(&self, id: TransactionId) -> Vec<u8> {
+        self.0.with_id(id)
     }
 }

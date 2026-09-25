@@ -11,7 +11,7 @@ use crate::{
     forwarding::RequestHandler,
     logging,
     routing::RoutingTable,
-    transport::{self, Deadline, IO_POLL, Transport},
+    transport::{self, Deadline, IO_POLL, REQUEST_TIMEOUT, Transport},
 };
 use pool::{Pool, Worker};
 use std::{
@@ -38,6 +38,7 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 struct Datagram {
     wire: Vec<u8>,
     peer: SocketAddr,
+    deadline: Deadline,
 }
 /// An accepted stream whose first-frame budget already includes queue time.
 struct Connection {
@@ -58,7 +59,7 @@ impl Server {
     /// Returns socket bind or timeout-configuration errors. If either protocol
     /// fails to initialize, the other socket is dropped before returning.
     pub(crate) fn bind(config: Config) -> io::Result<Self> {
-        let listen = config.listen.socket();
+        let listen = config.listen;
         let udp = UdpSocket::bind(listen)?;
         let tcp = TcpListener::bind(listen)?;
         udp.set_read_timeout(Some(IO_POLL))?;
@@ -81,13 +82,13 @@ impl Server {
     pub(crate) fn run(self, stop: Arc<AtomicBool>) -> io::Result<()> {
         // The flag carries no associated data. Channels transfer job ownership,
         // so reading or setting cancellation does not require acquire/release.
-        let udp_pool = Pool::new(UDP_WORKERS, UDP_QUEUE, Arc::clone(&stop), "udp", || {
+        let mut udp_pool = Pool::new(UDP_WORKERS, UDP_QUEUE, Arc::clone(&stop), "udp", || {
             Ok(UdpWorker {
                 handler: RequestHandler::new(Arc::clone(&self.routing), Arc::clone(&stop))?,
                 socket: Arc::clone(&self.udp),
             })
         })?;
-        let tcp_pool = Pool::new(TCP_WORKERS, TCP_QUEUE, Arc::clone(&stop), "tcp", || {
+        let mut tcp_pool = Pool::new(TCP_WORKERS, TCP_QUEUE, Arc::clone(&stop), "tcp", || {
             Ok(TcpWorker {
                 handler: RequestHandler::new(Arc::clone(&self.routing), Arc::clone(&stop))?,
                 stop: Arc::clone(&stop),
@@ -102,10 +103,10 @@ impl Server {
             .spawn(move || {
                 let result = accept_tcp(&listener, &shutdown, &tcp_pool);
                 shutdown.store(true, Ordering::Relaxed);
-                drop(tcp_pool);
+                let workers = tcp_pool.shutdown(Instant::now() + LISTENER_SHUTDOWN_TIMEOUT);
                 // Completion includes worker teardown, not just leaving accept.
                 let _ = finished.send(());
-                result
+                result.and(workers)
             })?;
         logging::info(format_args!(
             "startup: listening on {} (UDP and TCP)",
@@ -118,7 +119,7 @@ impl Server {
         // std has no accept timeout. A local connection wakes blocking accept;
         // the stop check after accept prevents it from entering the worker queue.
         let wake = TcpStream::connect_timeout(&address, IO_POLL).map(drop);
-        drop(udp_pool);
+        let udp_workers = udp_pool.shutdown(shutdown_deadline);
         let tcp_result = match completion
             .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
         {
@@ -142,7 +143,7 @@ impl Server {
         if tcp_result.is_ok() {
             logging::info(format_args!("shutdown complete"));
         }
-        result.and(tcp_result)
+        result.and(udp_workers).and(tcp_result)
     }
 }
 
@@ -152,12 +153,14 @@ fn receive_udp(udp: &UdpSocket, stop: &AtomicBool, pool: &Pool<UdpWorker>) -> io
     while !stop.load(Ordering::Relaxed) {
         match udp.recv_from(&mut buffer) {
             Ok((length, peer)) => {
+                let deadline = Deadline::after(REQUEST_TIMEOUT);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 if !pool.submit(Datagram {
                     wire: buffer[..length].to_vec(),
                     peer,
+                    deadline,
                 }) {
                     logging::warn(format_args!("UDP capacity reached; dropping packet"));
                 }
@@ -228,22 +231,37 @@ fn accept_error_is_retryable(error: &io::Error) -> bool {
         | io::ErrorKind::NetworkUnreachable
         | io::ErrorKind::HostUnreachable => true,
         // Several of the errnos named by accept(2) have no ErrorKind yet.
-        _ => matches!(
-            error.raw_os_error(),
-            Some(
-                64 |  // ENONET
-                71 |  // EPROTO
-                92 |  // ENOPROTOOPT
-                95 |  // EOPNOTSUPP
-                100 | // ENETDOWN
-                101 | // ENETUNREACH
-                103 | // ECONNABORTED
-                104 | // ECONNRESET
-                112 | // EHOSTDOWN
-                113 // EHOSTUNREACH
-            )
-        ),
+        _ => linux_accept_error_is_retryable(error.raw_os_error()),
     }
+}
+
+/// Linux pending network errors without portable ErrorKind equivalents.
+fn linux_accept_error_is_retryable(errno: Option<i32>) -> bool {
+    const ENONET: i32 = 64;
+    const EPROTO: i32 = 71;
+    const ENOPROTOOPT: i32 = 92;
+    const EOPNOTSUPP: i32 = 95;
+    const ENETDOWN: i32 = 100;
+    const ENETUNREACH: i32 = 101;
+    const ECONNABORTED: i32 = 103;
+    const ECONNRESET: i32 = 104;
+    const EHOSTDOWN: i32 = 112;
+    const EHOSTUNREACH: i32 = 113;
+    matches!(
+        errno,
+        Some(
+            ENONET
+                | EPROTO
+                | ENOPROTOOPT
+                | EOPNOTSUPP
+                | ENETDOWN
+                | ENETUNREACH
+                | ECONNABORTED
+                | ECONNRESET
+                | EHOSTDOWN
+                | EHOSTUNREACH
+        )
+    )
 }
 
 /// Processes a connection's frames in order until EOF, cancellation or I/O error.
@@ -262,11 +280,12 @@ fn serve_tcp(
         let Some(wire) = transport::read_frame(&mut client.stream, deadline, stop)? else {
             break;
         };
-        if let Some(response) = handler.respond(&wire, Transport::Tcp) {
+        let request_deadline = Deadline::after(REQUEST_TIMEOUT);
+        if let Some(response) = handler.respond(&wire, Transport::Tcp, request_deadline) {
             transport::write_frame(
                 &mut client.stream,
                 &response,
-                Deadline::after(CLIENT_WRITE_TIMEOUT),
+                request_deadline.capped(CLIENT_WRITE_TIMEOUT),
                 stop,
             )?;
         }
@@ -285,7 +304,9 @@ impl Worker for UdpWorker {
     type Job = Datagram;
 
     fn handle(&mut self, job: Datagram) {
-        if let Some(wire) = self.handler.respond(&job.wire, Transport::Udp)
+        if let Some(wire) = self
+            .handler
+            .respond(&job.wire, Transport::Udp, job.deadline)
             && let Err(error) = self.socket.send_to(&wire, job.peer)
         {
             logging::warn(format_args!("UDP client response failed: {error}"));
@@ -358,5 +379,80 @@ mod tests {
         }
         let fatal = io::Error::new(io::ErrorKind::InvalidInput, "closed");
         assert!(!accept_error_is_retryable(&fatal));
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::mpsc;
+    struct GatedWorker {
+        inner: UdpWorker,
+        gate: Option<mpsc::Receiver<()>>,
+        entered: mpsc::Sender<()>,
+        finished: mpsc::Sender<()>,
+    }
+    impl Worker for GatedWorker {
+        type Job = Datagram;
+        fn maintain(&mut self) {
+            if let Some(gate) = self.gate.take() {
+                self.entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        }
+        fn handle(&mut self, job: Datagram) {
+            self.inner.handle(job);
+            self.finished.send(()).unwrap();
+        }
+    }
+    #[test]
+    fn expired_udp_job_waiting_in_queue_never_reaches_any_upstream() {
+        use crate::routing::{Route, UpstreamAddress, UpstreamGroup};
+        let private = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let public = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let group = |s: &UdpSocket| {
+            UpstreamGroup::new(vec![UpstreamAddress::new(s.local_addr().unwrap()).unwrap()])
+                .unwrap()
+        };
+        let routing = RoutingTable::new(
+            group(&public),
+            vec![Route {
+                suffix: "private.test".parse().unwrap(),
+                upstreams: group(&private),
+            }],
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (release, gate) = mpsc::channel();
+        let (entered, waiting) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let mut worker = Some(GatedWorker {
+            inner: UdpWorker {
+                handler: RequestHandler::new(Arc::new(routing), Arc::clone(&stop)).unwrap(),
+                socket,
+            },
+            gate: Some(gate),
+            entered,
+            finished,
+        });
+        let mut pool = Pool::new(1, 1, stop, "queue-test", || Ok(worker.take().unwrap())).unwrap();
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(pool.submit(Datagram {
+            wire: b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07private\x04test\x00\x00\x01\x00\x01".to_vec(),
+            peer: client.local_addr().unwrap(), deadline: Deadline::after(Duration::ZERO),
+        }));
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        pool.shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        for socket in [&private, &public, &client] {
+            socket.set_nonblocking(true).unwrap();
+            assert_eq!(
+                socket.recv(&mut [0; 512]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 }

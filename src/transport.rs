@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Total request budget, including UDP queue age and all upstream attempts.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Maximum socket-poll interval between cancellation checks during frame I/O.
 pub(crate) const IO_POLL: Duration = Duration::from_millis(100);
 
@@ -27,6 +30,10 @@ impl Deadline {
     pub(crate) fn after(duration: Duration) -> Self {
         Self(Instant::now() + duration)
     }
+    /// Caps a phase or upstream attempt without extending the request budget.
+    pub(crate) fn capped(self, duration: Duration) -> Self {
+        Self(self.0.min(Instant::now() + duration))
+    }
     /// Returns the positive remaining budget after checking cancellation.
     ///
     /// # Errors
@@ -34,10 +41,7 @@ impl Deadline {
     /// budget is exhausted. Cancellation takes precedence over expiry.
     pub(crate) fn remaining(self, stop: &AtomicBool) -> io::Result<Duration> {
         if stop.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "shutdown requested",
-            ));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, Cancelled));
         }
         self.0
             .checked_duration_since(Instant::now())
@@ -45,6 +49,16 @@ impl Deadline {
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "exchange deadline expired"))
     }
 }
+
+/// Distinguishes service cancellation from an ordinary interrupted OS call.
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("shutdown requested")
+    }
+}
+impl std::error::Error for Cancelled {}
 
 /// Identifies socket outcomes that permit retry after rechecking stop/deadline.
 ///
@@ -83,6 +97,7 @@ fn read_exact(
             Err(error) => return Err(error),
         }
     }
+    deadline.remaining(stop)?;
     Ok(true)
 }
 
@@ -156,6 +171,7 @@ pub(crate) fn write_frame(
             Err(error) => return Err(error),
         }
     }
+    deadline.remaining(stop)?;
     Ok(())
 }
 

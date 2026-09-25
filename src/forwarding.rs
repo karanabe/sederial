@@ -4,11 +4,11 @@
 //! and `transport`; this module returns a complete DNS message or a decision
 //! to discard the input without replying.
 use crate::{
-    dns::{Header, HeaderResponseCode, MessageType, Packet, QueryDecision, ResponseCode},
+    dns::{Header, MessageType, Packet, QueryDecision, ResponseCode},
     logging,
     routing::RoutingTable,
-    transport::Transport,
-    upstream::Forwarder,
+    transport::{Deadline, Transport},
+    upstream::{ForwardError, Forwarder},
 };
 use std::{
     io,
@@ -45,7 +45,14 @@ impl RequestHandler {
     /// Returns `None` for an unreadable header or an unsolicited response.
     /// Successful upstream replies regain the client's ID; oversized UDP replies
     /// become complete minimal TC replies. Upstream failures become SERVFAIL.
-    pub(crate) fn respond(&mut self, wire: &[u8], transport: Transport) -> Option<Vec<u8>> {
+    pub(crate) fn respond(
+        &mut self,
+        wire: &[u8],
+        transport: Transport,
+        deadline: Deadline,
+    ) -> Option<Vec<u8>> {
+        // Expired queued jobs and cancellation are silent, with no parsing or I/O.
+        deadline.remaining(&self.stop).ok()?;
         let header = match Header::parse(wire) {
             Ok(header) => header,
             Err(error) => {
@@ -57,34 +64,49 @@ impl RequestHandler {
         if header.message_type() != MessageType::Query {
             return None;
         }
-        let packet = match Packet::parse(wire) {
+        let packet = match Packet::parse_for_reply(wire) {
             Ok(packet) => packet,
-            Err(error) => {
-                logging::warn(format_args!("malformed client packet: {error}"));
-                // Only the header is trustworthy, so do not echo a question or
-                // OPT record from a packet that failed structural validation.
-                return Some(header.error_reply(HeaderResponseCode::FORMAT_ERROR));
+            Err(failure) => {
+                logging::warn(format_args!("malformed client packet: {}", failure.error));
+                return failure.format_reply();
             }
         };
         let query = match packet.validate_query() {
             QueryDecision::Forward(query) => query,
-            QueryDecision::Reject(code) => return Some(packet.error_reply(code)),
+            QueryDecision::Reject(code) => {
+                let reply = packet.local_error_reply(code);
+                if reply.is_none() {
+                    logging::warn(format_args!(
+                        "local error suppressed: no validated response cookie"
+                    ));
+                }
+                return reply;
+            }
             QueryDecision::Ignore => return None,
         };
         let selection = self.routing.select(query.name());
         let upstreams = selection.upstreams();
         let response = match self
             .forwarder
-            .forward(&query, upstreams, transport, &self.stop)
+            .forward(&query, upstreams, transport, &self.stop, deadline)
         {
             Ok(response) => response,
+            Err(ForwardError::Cancelled) => return None,
             Err(error) => {
+                deadline.remaining(&self.stop).ok()?;
                 logging::warn(format_args!("forwarding failed: {error}"));
-                return Some(query.error_reply(ResponseCode::ServerFailure));
+                let reply = query.error_reply(ResponseCode::ServerFailure);
+                if reply.is_none() {
+                    logging::warn(format_args!(
+                        "local error suppressed: no validated response cookie"
+                    ));
+                }
+                return reply;
             }
         };
+        deadline.remaining(&self.stop).ok()?;
         if matches!(transport, Transport::Udp) && response.wire().len() > query.udp_limit() {
-            Some(query.truncated_reply(response.response_code()))
+            Some(query.truncated_reply(&response))
         } else {
             Some(response.with_id(query.id()))
         }

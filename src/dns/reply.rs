@@ -17,15 +17,42 @@ use super::{
 /// Absence of OPT and an OPT with DO clear are different messages.
 enum GeneratedOpt {
     Absent,
-    Present { dnssec_ok: bool },
+    Present {
+        dnssec_ok: bool,
+        cookie: Option<Vec<u8>>,
+    },
 }
 
 fn generated_opt(edns: Option<Edns>) -> GeneratedOpt {
     match edns {
         Some(opt) => GeneratedOpt::Present {
             dnssec_ok: opt.dnssec_ok,
+            cookie: None,
         },
         None => GeneratedOpt::Absent,
+    }
+}
+
+/// Only the DNS parser constructs partial context, from checked fields.
+#[derive(Debug)]
+pub(super) struct ReplyContext {
+    pub(super) header: Header,
+    pub(super) question: Option<Question>,
+    pub(super) edns: Option<Edns>,
+}
+
+impl ReplyContext {
+    pub(super) fn format_reply(&self) -> Vec<u8> {
+        if self.edns.is_none() {
+            return self.header.error_reply(HeaderResponseCode::FORMAT_ERROR);
+        }
+        make_reply(
+            self.header,
+            self.question.as_ref(),
+            ResponseCode::FormatError,
+            false,
+            generated_opt(self.edns),
+        )
     }
 }
 
@@ -40,6 +67,14 @@ impl Header {
 }
 
 impl Packet {
+    /// No local signing secret exists. A client supplying a Server Cookie may
+    /// discard a cookie-less reply; never echo that unverified cookie as proof.
+    pub(crate) fn local_error_reply(&self, code: ResponseCode) -> Option<Vec<u8>> {
+        if super::cookie::response_cookie(self).is_some_and(|cookie| cookie.len() > 8) {
+            return None;
+        }
+        Some(self.error_reply(code))
+    }
     /// Builds an error preserving a parsed question and valid OPT presence/DO bit.
     ///
     /// The generated OPT uses EDNS version zero, including when answering BADVERS.
@@ -53,13 +88,17 @@ impl Packet {
         )
     }
     /// A complete minimal response with TC, never a byte slice cutting an RR in half.
-    pub(crate) fn truncated_reply(&self, code: ResponseCode) -> Vec<u8> {
+    pub(crate) fn truncated_reply(&self, response: &super::message::Response) -> Vec<u8> {
+        let mut opt = generated_opt(self.edns);
+        if let GeneratedOpt::Present { cookie, .. } = &mut opt {
+            *cookie = super::cookie::response_cookie(&response.0).map(<[u8]>::to_vec);
+        }
         make_reply(
             self.header,
             self.questions.first(),
-            code,
+            response.response_code(),
             true,
-            generated_opt(self.edns),
+            opt,
         )
     }
 }
@@ -94,7 +133,7 @@ fn make_reply(
     if let Some(question) = question {
         question.encode(&mut wire);
     }
-    if let GeneratedOpt::Present { dnssec_ok } = edns {
+    if let GeneratedOpt::Present { dnssec_ok, cookie } = edns {
         wire.push(0); // OPT owner is the root name.
         wire.extend_from_slice(&RecordType::Opt.wire().to_be_bytes());
         wire.extend_from_slice(&(SERVER_UDP_LENGTH as u16).to_be_bytes());
@@ -102,7 +141,13 @@ fn make_reply(
         let extended = u32::from((code.wire() >> 4) as u8);
         let ttl = (extended << EXTENDED_RCODE_SHIFT) | if dnssec_ok { DO_MASK } else { 0 };
         wire.extend_from_slice(&ttl.to_be_bytes());
-        wire.extend_from_slice(&0_u16.to_be_bytes());
+        let length = cookie.as_ref().map_or(0, |cookie| 4 + cookie.len());
+        wire.extend_from_slice(&(length as u16).to_be_bytes());
+        if let Some(cookie) = cookie {
+            wire.extend_from_slice(&10_u16.to_be_bytes());
+            wire.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+            wire.extend_from_slice(&cookie);
+        }
     }
     wire
 }

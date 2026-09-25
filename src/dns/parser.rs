@@ -9,7 +9,7 @@ use super::{
         DO_MASK, EDNS_VERSION_SHIFT, EXTENDED_RCODE_SHIFT, Edns, Header, Packet, Question,
         RecordSection,
     },
-    types::{RecordClass, RecordType},
+    types::{Opcode, RecordClass, RecordType},
 };
 
 const QUESTION_FIXED_LENGTH: usize = 4;
@@ -91,13 +91,12 @@ impl Reader<'_> {
         let ttl = self.double_word()?;
         let data_length = usize::from(self.word()?);
         let data_start = self.cursor;
-        self.take(data_length)?;
         Ok(ResourceRecord {
             owner,
             kind,
             class,
             ttl,
-            data: data_start..self.cursor,
+            data: data_start..data_start + data_length,
         })
     }
 }
@@ -118,16 +117,41 @@ struct ResourceRecord {
 }
 
 /// Checks section bounds and record structure before retaining the original packet.
-pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
+pub(super) fn parse(wire: &[u8]) -> Result<Packet, super::error::ParseFailure> {
+    let mut context = None;
+    parse_inner(wire, &mut context).map_err(|error| {
+        // Only an OPT processing failure permits these partial metadata to be
+        // used. Other structural failures retain the header-only policy.
+        if error != ParseError::InvalidEdns
+            && let Some(context) = &mut context
+        {
+            context.question = None;
+            context.edns = None;
+        }
+        super::error::ParseFailure { error, context }
+    })
+}
+
+fn parse_inner(
+    wire: &[u8],
+    context: &mut Option<super::reply::ReplyContext>,
+) -> Result<Packet, ParseError> {
     if wire.len() > MAX_MESSAGE_LENGTH {
         return Err(ParseError::OversizedMessage);
     }
     let header = Header::parse(wire)?;
+    if header.message_type() == super::MessageType::Query {
+        *context = Some(super::reply::ReplyContext {
+            header,
+            question: None,
+            edns: None,
+        });
+    }
     // Reject impossible counts before allocating, even for compressed root names.
     let question_count = usize::from(header.counts.questions);
     // Standard DNS queries have at most one question (RFC 9619). Reject before
     // allocating names: repeated compressed questions could amplify memory use.
-    if question_count > 1 {
+    if question_count > 1 && header.opcode() == Opcode::Query {
         return Err(ParseError::InvalidCount);
     }
     let record_count: usize = header
@@ -149,6 +173,9 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
     for _ in 0..question_count {
         questions.push(reader.question()?);
     }
+    if let Some(context) = context {
+        context.question = questions.first().cloned();
+    }
     let mut edns = None;
     let mut cookie = None;
     let mut authenticated = false;
@@ -165,8 +192,6 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
                 let ClassField::UdpPayload(udp_size) = record.class else {
                     return Err(ParseError::InvalidEdns);
                 };
-                validate_options(&wire[record.data.clone()])?;
-                cookie = super::cookie::locate(wire, record.data.start, record.data.len());
                 // OPT reuses TTL for extended RCODE, version and flags.
                 edns = Some(Edns {
                     udp_size,
@@ -174,7 +199,16 @@ pub(super) fn parse(wire: &[u8]) -> Result<Packet, ParseError> {
                     extended_rcode: (record.ttl >> EXTENDED_RCODE_SHIFT) as u8,
                     dnssec_ok: record.ttl & DO_MASK != 0,
                 });
+                if let Some(context) = context {
+                    context.edns = edns;
+                }
+                reader
+                    .take(record.data.len())
+                    .map_err(|_| ParseError::InvalidEdns)?;
+                validate_options(&wire[record.data.clone()])?;
+                cookie = super::cookie::locate(wire, record.data.start, record.data.len());
             } else {
+                reader.take(record.data.len())?;
                 validate_data(wire, &record)?;
             }
             authenticated |= matches!(record.kind, RecordType::Tsig | RecordType::Tkey)

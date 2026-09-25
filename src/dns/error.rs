@@ -41,3 +41,16 @@ impl fmt::Display for ParseError {
 }
 
 impl Error for ParseError {}
+
+/// Parsing failed, but the parser may have established safe local reply fields.
+#[derive(Debug)]
+pub(crate) struct ParseFailure {
+    pub(crate) error: ParseError,
+    pub(super) context: Option<super::reply::ReplyContext>,
+}
+
+impl ParseFailure {
+    pub(crate) fn format_reply(&self) -> Option<Vec<u8>> {
+        self.context.as_ref().map(|context| context.format_reply())
+    }
+}

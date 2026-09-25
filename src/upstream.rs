@@ -6,8 +6,8 @@
 
 use crate::{
     dns::{
-        MAX_MESSAGE_LENGTH, Packet, ParseError, Query, ResponseCode, ServerCookieRetry,
-        TransactionId,
+        MAX_MESSAGE_LENGTH, Packet, ParseError, Query, Response, ResponseCode, SentQuery,
+        ServerCookieRetry, TransactionId,
     },
     logging,
     routing::{UpstreamAddress, UpstreamGroup},
@@ -36,9 +36,7 @@ struct CachedConnection {
 
 /// One attempt keeps its query, rewritten ID and deadline across UDP/TCP fallback.
 struct Exchange<'a> {
-    query: &'a Query<'a>,
-    id: TransactionId,
-    wire: Vec<u8>,
+    sent: SentQuery,
     deadline: Deadline,
     stop: &'a AtomicBool,
 }
@@ -71,7 +69,7 @@ impl Forwarder {
         }
     }
 
-    /// Tries the selected endpoints in order with a fresh ID and budget per endpoint.
+    /// Tries selected endpoints in order with fresh IDs and capped attempt budgets.
     ///
     /// UDP truncation, a DNS Cookie retry, and one retry of a reused TCP stream
     /// share the current endpoint's deadline. SERVFAIL, REFUSED and exchange
@@ -88,19 +86,18 @@ impl Forwarder {
         upstreams: &UpstreamGroup,
         transport: Transport,
         stop: &AtomicBool,
-    ) -> Result<Packet, ForwardError> {
+        request_deadline: Deadline,
+    ) -> Result<Response, ForwardError> {
         let mut last_error = ForwardError::Timeout;
-        // REFUSED is a real DNS answer. If nothing in the group produces a
-        // final answer, relay the latest REFUSED instead of a local SERVFAIL.
+        // Retain the latest validated DNS failure, including its opaque EDE.
+        // Later transport failures do not replace a DNS response.
         let mut relayed_failure = None;
         for address in upstreams.servers() {
-            let deadline = Deadline::after(ATTEMPT_TIMEOUT);
+            let deadline = request_deadline.capped(ATTEMPT_TIMEOUT);
             deadline.remaining(stop).map_err(ForwardError::from)?;
             let id = self.next_transaction_id()?;
             let exchange = Exchange {
-                query,
-                id,
-                wire: query.with_id(id),
+                sent: query.sent(id),
                 deadline,
                 stop,
             };
@@ -112,6 +109,7 @@ impl Forwarder {
                 Ok(response) if response.response_code() == ResponseCode::BadCookie => {
                     match self.finish_badcookie(*address, &exchange, response, transport) {
                         Ok(response) => response,
+                        Err(ForwardError::Cancelled) => return Err(ForwardError::Cancelled),
                         Err(error) => {
                             last_error = error;
                             logging::warn(format_args!("upstream {address}: {last_error}"));
@@ -120,6 +118,7 @@ impl Forwarder {
                     }
                 }
                 Ok(response) => response,
+                Err(ForwardError::Cancelled) => return Err(ForwardError::Cancelled),
                 Err(error) => {
                     last_error = error;
                     logging::warn(format_args!("upstream {address}: {last_error}"));
@@ -128,16 +127,16 @@ impl Forwarder {
             };
             // A BADCOOKIE here already finished the cookie retry. SERVFAIL and
             // REFUSED, including those from that retry, still advance.
+            request_deadline.remaining(stop)?;
             let code = response.response_code();
             if code == ResponseCode::BadCookie || !retries_in_group(code) {
                 return Ok(response);
             }
             last_error = ForwardError::from_rcode(code);
-            if code != ResponseCode::ServerFailure {
-                relayed_failure = Some(response);
-            }
+            relayed_failure = Some(response);
             logging::warn(format_args!("upstream {address}: {last_error}"));
         }
+        request_deadline.remaining(stop)?;
         relayed_failure.ok_or(last_error)
     }
 
@@ -149,60 +148,61 @@ impl Forwarder {
         &mut self,
         address: UpstreamAddress,
         exchange: &Exchange<'_>,
-        response: Packet,
+        response: Response,
         transport: Transport,
-    ) -> Result<Packet, ForwardError> {
-        match exchange
-            .query
-            .server_cookie_retry(&exchange.wire, &response)
-        {
-            ServerCookieRetry::Absent | ServerCookieRetry::Leave => Ok(response),
+    ) -> Result<Response, ForwardError> {
+        match exchange.sent.server_cookie_retry(&response) {
+            ServerCookieRetry::Absent => Ok(response),
             ServerCookieRetry::Discard => Err(ForwardError::InvalidResponse),
-            ServerCookieRetry::Current if matches!(transport, Transport::Tcp) => Ok(response),
-            ServerCookieRetry::Current => {
-                self.resend(address, exchange, exchange.wire.clone(), Transport::Tcp)
+            ServerCookieRetry::Current | ServerCookieRetry::Tcp
+                if matches!(transport, Transport::Tcp) =>
+            {
+                Ok(response)
+            }
+            ServerCookieRetry::Current | ServerCookieRetry::Tcp => {
+                let retry = self.retry_exchange(exchange, exchange.sent.wire().to_vec())?;
+                self.tcp_exchange(address, &retry)
             }
             ServerCookieRetry::Rewrite(wire) => {
-                let retried = self.resend(address, exchange, wire.clone(), transport)?;
+                let retry = self.retry_exchange(exchange, wire)?;
+                let retried = match transport {
+                    Transport::Tcp => self.tcp_exchange(address, &retry)?,
+                    Transport::Udp => self.udp_exchange(address, &retry)?,
+                };
                 if retried.response_code() != ResponseCode::BadCookie
                     || matches!(transport, Transport::Tcp)
                 {
                     return Ok(retried);
                 }
-                // The rewritten query is longer than the original slot, so the
-                // cookie location has to be read from the bytes that were sent.
-                let sent_packet = Packet::parse(&wire).map_err(ForwardError::Parse)?;
-                let tcp_wire = match sent_packet.server_cookie_retry(&wire, &retried) {
+                let wire = match retry.sent.server_cookie_retry(&retried) {
                     ServerCookieRetry::Rewrite(wire) => wire,
-                    ServerCookieRetry::Current => wire,
-                    ServerCookieRetry::Absent | ServerCookieRetry::Leave => return Ok(retried),
-                    ServerCookieRetry::Discard => return Err(ForwardError::InvalidResponse),
+                    ServerCookieRetry::Current | ServerCookieRetry::Tcp => {
+                        retry.sent.wire().to_vec()
+                    }
+                    ServerCookieRetry::Absent | ServerCookieRetry::Discard => {
+                        return Err(ForwardError::InvalidResponse);
+                    }
                 };
-                self.resend(address, exchange, tcp_wire, Transport::Tcp)
+                let retry = self.retry_exchange(&retry, wire)?;
+                self.tcp_exchange(address, &retry)
             }
         }
     }
 
-    fn resend(
+    fn retry_exchange<'a>(
         &mut self,
-        address: UpstreamAddress,
-        exchange: &Exchange<'_>,
-        mut wire: Vec<u8>,
-        transport: Transport,
-    ) -> Result<Packet, ForwardError> {
-        let id = self.next_transaction_id()?;
-        wire[..2].copy_from_slice(&id.0.to_be_bytes());
-        let exchange = Exchange {
-            query: exchange.query,
-            id,
-            wire,
+        exchange: &Exchange<'a>,
+        wire: Vec<u8>,
+    ) -> Result<Exchange<'a>, ForwardError> {
+        exchange.deadline.remaining(exchange.stop)?;
+        Ok(Exchange {
+            sent: exchange
+                .sent
+                .retry(wire, self.next_transaction_id()?)
+                .map_err(ForwardError::Parse)?,
             deadline: exchange.deadline,
             stop: exchange.stop,
-        };
-        match transport {
-            Transport::Tcp => self.tcp_exchange(address, &exchange),
-            Transport::Udp => self.udp_exchange(address, &exchange),
-        }
+        })
     }
 
     fn next_transaction_id(&mut self) -> io::Result<TransactionId> {
@@ -216,7 +216,7 @@ impl Forwarder {
         &mut self,
         address: UpstreamAddress,
         exchange: &Exchange<'_>,
-    ) -> Result<Packet, ForwardError> {
+    ) -> Result<Response, ForwardError> {
         let bind = if address.socket().is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -225,7 +225,7 @@ impl Forwarder {
         let socket = UdpSocket::bind(bind)?;
         socket.connect(address.socket())?; // Kernel filters unexpected source address and port.
         socket.set_write_timeout(Some(exchange.deadline.remaining(exchange.stop)?))?;
-        socket.send(&exchange.wire)?;
+        socket.send(exchange.sent.wire())?;
         let mut bytes = vec![0; MAX_MESSAGE_LENGTH];
         let mut invalid_responses = 0;
         loop {
@@ -237,16 +237,17 @@ impl Forwarder {
                 Err(error) if transport::transient(&error) => continue,
                 Err(error) => return Err(error.into()),
             };
+            exchange.deadline.remaining(exchange.stop)?;
             // Check the complete header/question before parsing records: TC can
             // legitimately accompany a datagram cut in the middle of a record.
-            if exchange
-                .query
-                .matches_truncated(&bytes[..length], exchange.id)
-            {
+            if exchange.sent.matches_truncated(&bytes[..length]) {
                 return self.tcp_exchange(address, exchange);
             }
-            match Packet::parse(&bytes[..length]) {
-                Ok(response) if response.corresponds_to(exchange.query, exchange.id) => {
+            match Packet::parse(&bytes[..length])
+                .ok()
+                .and_then(|response| exchange.sent.validate_response(response))
+            {
+                Some(response) => {
                     return Ok(response);
                 }
                 _ => {
@@ -269,7 +270,7 @@ impl Forwarder {
         &mut self,
         address: UpstreamAddress,
         exchange: &Exchange<'_>,
-    ) -> Result<Packet, ForwardError> {
+    ) -> Result<Response, ForwardError> {
         self.expire_idle();
         // Taking ownership removes the cache entry before any fallible I/O.
         // Failed, partial or mismatched exchanges therefore cannot leave a
@@ -310,15 +311,15 @@ impl Forwarder {
 
 impl Exchange<'_> {
     /// Sends one frame and accepts exactly one complete, correlated TCP response.
-    fn send_over_tcp(&self, stream: &mut TcpStream) -> Result<Packet, ForwardError> {
-        transport::write_frame(stream, &self.wire, self.deadline, self.stop)?;
+    fn send_over_tcp(&self, stream: &mut TcpStream) -> Result<Response, ForwardError> {
+        transport::write_frame(stream, self.sent.wire(), self.deadline, self.stop)?;
         let bytes = transport::read_frame(stream, self.deadline, self.stop)?
             .ok_or(ForwardError::InvalidResponse)?;
+        self.deadline.remaining(self.stop)?;
         let response = Packet::parse(&bytes).map_err(ForwardError::Parse)?;
-        if !response.corresponds_to(self.query, self.id) || response.is_truncated() {
-            return Err(ForwardError::InvalidResponse);
-        }
-        Ok(response)
+        self.sent
+            .validate_response(response)
+            .ok_or(ForwardError::InvalidResponse)
     }
 }
 
@@ -326,6 +327,7 @@ impl Exchange<'_> {
 #[derive(Debug)]
 pub(crate) enum ForwardError {
     Timeout,
+    Cancelled,
     Io(io::Error),
     Parse(ParseError),
     InvalidResponse,
@@ -334,7 +336,12 @@ pub(crate) enum ForwardError {
 }
 impl From<io::Error> for ForwardError {
     fn from(error: io::Error) -> Self {
-        if matches!(
+        if error
+            .get_ref()
+            .is_some_and(|source| source.is::<transport::Cancelled>())
+        {
+            Self::Cancelled
+        } else if matches!(
             error.kind(),
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ) {
@@ -348,6 +355,7 @@ impl fmt::Display for ForwardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout => f.write_str("exchange timed out"),
+            Self::Cancelled => f.write_str("shutdown requested"),
             Self::Io(e) => e.fmt(f),
             Self::Parse(e) => e.fmt(f),
             Self::InvalidResponse => f.write_str("invalid or uncorrelated response"),
@@ -378,5 +386,209 @@ impl Error for ForwardError {
             Self::Parse(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        net::TcpListener,
+        sync::{Arc, mpsc},
+        thread,
+    };
+    const QUERY: &[u8] =
+        b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x04test\x00\x00\x01\x00\x01";
+    const BUDGET: Duration = Duration::from_millis(150);
+    const GUARD: Duration = Duration::from_secs(2);
+
+    fn group(sockets: &[&UdpSocket]) -> UpstreamGroup {
+        UpstreamGroup::new(
+            sockets
+                .iter()
+                .map(|s| UpstreamAddress::new(s.local_addr().unwrap()).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+    fn receive(socket: &UdpSocket) -> (Vec<u8>, std::net::SocketAddr) {
+        socket.set_read_timeout(Some(GUARD)).unwrap();
+        let mut bytes = vec![0; 1024];
+        let (len, peer) = socket.recv_from(&mut bytes).unwrap();
+        bytes.truncate(len);
+        (bytes, peer)
+    }
+    fn untouched(socket: &UdpSocket) {
+        socket.set_nonblocking(true).unwrap();
+        assert_eq!(
+            socket.recv(&mut [0; 1024]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    fn accept(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let until = Instant::now() + GUARD;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                other => panic!("missing TCP fallback: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn request_budget_bounds_failover_and_shutdown_never_contacts_next_server() {
+        for cancel in [false, true] {
+            let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let never = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let upstreams = group(&[&first, &silent, &never]);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let peer = thread::spawn(move || {
+                let (mut q, source) = receive(&first);
+                q[2] |= 0x80;
+                q[3] = 0x85;
+                if cancel {
+                    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                first.send_to(&q, source).unwrap();
+            });
+            let packet = Packet::parse(QUERY).unwrap();
+            let crate::dns::QueryDecision::Forward(query) = packet.validate_query() else {
+                panic!()
+            };
+            let result = Forwarder::new().unwrap().forward(
+                &query,
+                &upstreams,
+                Transport::Udp,
+                &stop,
+                Deadline::after(BUDGET),
+            );
+            if cancel {
+                assert!(matches!(result, Err(ForwardError::Cancelled)));
+                untouched(&silent);
+            } else {
+                assert!(matches!(result, Err(ForwardError::Timeout)));
+                receive(&silent);
+            }
+            untouched(&never);
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn tc_cookie_and_reused_tcp_share_the_original_request_budget() {
+        for mode in ["tc", "cookie", "reconnect"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let udp = UdpSocket::bind(listener.local_addr().unwrap()).unwrap();
+            let never = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let upstreams = group(&[&udp, &never]);
+            let mut wire = QUERY.to_vec();
+            if mode == "cookie" {
+                wire[11] = 1;
+                wire.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 12, 0, 10, 0, 8]);
+                wire.extend_from_slice(&[7; 8]);
+            }
+            let mut forwarder = Forwarder::new().unwrap();
+            if mode == "reconnect" {
+                let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let peer = accept(&listener);
+                drop(peer);
+                forwarder.tcp = Some(CachedConnection {
+                    address: upstreams.servers()[0],
+                    stream,
+                    last_used: Instant::now(),
+                });
+            }
+            let (release, released) = mpsc::channel::<()>();
+            let peer = thread::spawn(move || {
+                if mode != "reconnect" {
+                    let (mut q, source) = receive(&udp);
+                    q[2] |= 0x80;
+                    if mode == "cookie" {
+                        let opt = QUERY.len();
+                        q[3] = 0x87;
+                        q[opt + 5] = 1;
+                        q[opt + 10] = 20;
+                        q[opt + 14] = 16;
+                        q.extend_from_slice(&[9; 8]);
+                        udp.send_to(&q, source).unwrap();
+                        let (mut retry, source) = receive(&udp);
+                        retry[2] |= 0x80;
+                        retry[3] = 0x87;
+                        retry[opt + 5] = 1;
+                        udp.send_to(&retry, source).unwrap();
+                    } else {
+                        q[2] |= 2;
+                        q[7] = 1;
+                        q.push(0xc0);
+                        udp.send_to(&q, source).unwrap();
+                    }
+                }
+                let mut stream = accept(&listener);
+                let received = transport::read_frame(
+                    &mut stream,
+                    Deadline::after(GUARD),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert!(received.is_some());
+                let _ = released.recv_timeout(GUARD);
+                // Hold the connection until the caller's original deadline ends.
+                let _ = stream.write_all(&[]);
+            });
+            let packet = Packet::parse(&wire).unwrap();
+            let crate::dns::QueryDecision::Forward(query) = packet.validate_query() else {
+                panic!()
+            };
+            let started = Instant::now();
+            let result = forwarder.forward(
+                &query,
+                &upstreams,
+                if mode == "reconnect" {
+                    Transport::Tcp
+                } else {
+                    Transport::Udp
+                },
+                &AtomicBool::new(false),
+                Deadline::after(BUDGET),
+            );
+            drop(release);
+            assert!(
+                matches!(result, Err(ForwardError::Timeout)),
+                "{mode}: {result:?}"
+            );
+            assert!(started.elapsed() < GUARD); // Guard only; no tight scheduler threshold.
+            untouched(&never);
+            peer.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancellation_is_distinct_from_an_interrupted_io_call() {
+        assert!(matches!(
+            ForwardError::from(io::Error::new(io::ErrorKind::Interrupted, "OS interrupt")),
+            ForwardError::Io(_)
+        ));
+        let cancelled = Deadline::after(Duration::from_secs(1))
+            .remaining(&AtomicBool::new(true))
+            .unwrap_err();
+        assert!(matches!(
+            ForwardError::from(cancelled),
+            ForwardError::Cancelled
+        ));
+        let timeout = Deadline::after(Duration::ZERO)
+            .remaining(&AtomicBool::new(false))
+            .unwrap_err();
+        assert!(matches!(ForwardError::from(timeout), ForwardError::Timeout));
     }
 }

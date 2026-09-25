@@ -22,7 +22,7 @@ const MAX_ROUTES: usize = 4096;
 /// Startup settings produced by whole-file validation before listeners bind.
 #[derive(Debug)]
 pub(crate) struct Config {
-    pub(crate) listen: UpstreamAddress,
+    pub(crate) listen: SocketAddr,
     pub(crate) routing: RoutingTable,
 }
 impl Config {
@@ -62,7 +62,8 @@ impl Config {
         // require destination-address tracking to send UDP replies from the
         // address the client originally queried.
         let listen = UpstreamAddress::new(listen)
-            .map_err(|error| ConfigError::Invalid(format!("listen: {error}")))?;
+            .map_err(|error| ConfigError::Invalid(format!("listen: {error}")))?
+            .socket();
         let default_table = table
             .get("default")
             .and_then(|v| v.get_ref().as_table())
@@ -144,7 +145,7 @@ fn reject_unknown_keys(
 /// Preserves configured failover order while validating endpoints and self-loops.
 fn parse_upstream_group(
     table: &Table<'_>,
-    listen: UpstreamAddress,
+    listen: SocketAddr,
 ) -> Result<UpstreamGroup, ConfigError> {
     let values = table
         .get("servers")
@@ -164,7 +165,6 @@ fn parse_upstream_group(
             .map_err(|_| ConfigError::Invalid(format!("invalid upstream address {raw:?}")))?;
         // Compare canonical IPs so an IPv4-mapped spelling cannot hide a direct
         // loop. Loops through other resolvers are outside local validation.
-        let listen = listen.socket();
         if address.port() == listen.port()
             && address.ip().to_canonical() == listen.ip().to_canonical()
         {
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn parses_complete_toml_and_ipv6() {
         let config = Config::parse("listen = '[::1]:5300'\n[default]\nservers = [\n '[::1]:5353', # comment\n]\n[[route]]\ndomain = '_tcp.EXAMPLE.test.'\nservers = ['127.0.0.1:5354']").unwrap();
-        assert!(config.listen.socket().is_ipv6());
+        assert!(config.listen.is_ipv6());
         assert_eq!(config.routing.routes().len(), 1);
     }
     #[test]
@@ -236,7 +236,7 @@ mod tests {
                 "listen='{raw}'\n[default]\nservers=['192.0.2.53']"
             ))
             .unwrap();
-            assert_eq!(config.listen.socket(), expected, "listen={raw}");
+            assert_eq!(config.listen, expected, "listen={raw}");
             let config = Config::parse(&format!(
                 "listen='127.0.0.2:5300'\n[default]\nservers=['{raw}']\n\
                  [[route]]\ndomain='example.test'\nservers=['{raw}']"
@@ -291,10 +291,7 @@ mod tests {
         let config =
             Config::parse("listen='[::ffff:127.0.0.1]'\n[default]\nservers=['192.0.2.53']\n")
                 .unwrap();
-        assert_eq!(
-            config.listen.socket(),
-            "127.0.0.1:53".parse::<SocketAddr>().unwrap()
-        );
+        assert_eq!(config.listen, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
     }
     #[test]
     fn rejects_invalid_config_as_a_whole() {

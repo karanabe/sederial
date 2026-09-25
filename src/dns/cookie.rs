@@ -1,8 +1,7 @@
 //! DNS COOKIE option location and the RFC 7873 retry query.
 //!
 //! Only the first COOKIE option is meaningful. Lengths other than 8 or 16–40
-//! are malformed; a forwarder still accepts the message, but it cannot retry
-//! from that option.
+//! are malformed. Responses require both a Client and Server Cookie (16–40).
 
 use super::Packet;
 
@@ -33,8 +32,8 @@ pub(crate) enum ServerCookieRetry {
     /// Query bytes using the server cookie from the response.
     Rewrite(Vec<u8>),
     /// The server cookie would move later bytes. Compression pointers are
-    /// absolute offsets, so the original BADCOOKIE is returned instead.
-    Leave,
+    /// absolute offsets, so retry the unchanged wire over TCP instead.
+    Tcp,
 }
 
 pub(super) fn locate(wire: &[u8], rdata_at: usize, rdata_len: usize) -> Option<CookieField> {
@@ -66,7 +65,30 @@ pub(super) fn locate(wire: &[u8], rdata_at: usize, rdata_len: usize) -> Option<C
     None
 }
 
-pub(super) fn retry(query: &Packet, sent: &[u8], response: &Packet) -> ServerCookieRetry {
+/// These bytes are correlation evidence, never locally authenticated cookies.
+pub(super) fn response_cookie(packet: &Packet) -> Option<&[u8]> {
+    match packet.cookie? {
+        CookieField::Present(slot) => {
+            Some(&packet.wire[slot.data_at..slot.data_at + slot.data_len])
+        }
+        CookieField::Malformed => None,
+    }
+}
+
+pub(super) fn valid_response(sent: &Packet, response: &Packet, required: bool) -> bool {
+    let Some(received) = response_cookie(response) else {
+        return response.cookie.is_none()
+            && !required
+            && response.response_code() != super::ResponseCode::BadCookie;
+    };
+    let Some(client) = response_cookie(sent) else {
+        return false;
+    };
+    (16..=40).contains(&received.len()) && client[..8] == received[..8]
+}
+
+pub(super) fn retry(query: &Packet, response: &Packet) -> ServerCookieRetry {
+    let sent = query.wire();
     let Some(query_field) = query.cookie else {
         return ServerCookieRetry::Absent;
     };
@@ -99,7 +121,7 @@ pub(super) fn retry(query: &Packet, sent: &[u8], response: &Packet) -> ServerCoo
     let data_end = query_cookie.data_at + query_cookie.data_len;
     let new_len = 8 + server.len();
     if new_len != query_cookie.data_len && data_end != sent.len() {
-        return ServerCookieRetry::Leave;
+        return ServerCookieRetry::Tcp;
     }
     rewrite(sent, query_cookie, &query_data[..8], server)
         .map_or(ServerCookieRetry::Discard, ServerCookieRetry::Rewrite)
@@ -163,13 +185,12 @@ mod tests {
     fn retry_inserts_the_server_cookie_and_rejects_a_mismatch() {
         let sent = query_with_cookie(None);
         let parsed = Packet::parse(&sent).unwrap();
-        let QueryDecision::Forward(query) = parsed.validate_query() else {
+        let QueryDecision::Forward(_query) = parsed.validate_query() else {
             panic!("expected a forwardable query");
         };
         let server = [0x11; 8];
         let response = Packet::parse(&as_badcookie(query_with_cookie(Some(&server)))).unwrap();
-        let ServerCookieRetry::Rewrite(rewritten) = query.server_cookie_retry(&sent, &response)
-        else {
+        let ServerCookieRetry::Rewrite(rewritten) = retry(&parsed, &response) else {
             panic!("expected a rewritten query");
         };
         let rewritten_packet = Packet::parse(&rewritten).unwrap();
@@ -184,11 +205,11 @@ mod tests {
             &rewritten[slot.data_at + 8..slot.data_at + slot.data_len],
             &server
         );
-        let QueryDecision::Forward(rewritten_query) = rewritten_packet.validate_query() else {
+        let QueryDecision::Forward(_rewritten_query) = rewritten_packet.validate_query() else {
             panic!("rewritten query should still be forwardable");
         };
         assert!(matches!(
-            rewritten_query.server_cookie_retry(&rewritten, &response),
+            retry(&rewritten_packet, &response),
             ServerCookieRetry::Current
         ));
 
@@ -199,7 +220,7 @@ mod tests {
         mismatched[slot.data_at] ^= 0xff;
         let mismatched = Packet::parse(&mismatched).unwrap();
         assert!(matches!(
-            query.server_cookie_retry(&sent, &mismatched),
+            retry(&parsed, &mismatched),
             ServerCookieRetry::Discard
         ));
     }
@@ -214,13 +235,57 @@ mod tests {
         sent[rdlen_at..rdlen_at + 2].copy_from_slice(&rdlen.to_be_bytes());
         sent.extend_from_slice(&[0, 1, 0, 0]);
         let parsed = Packet::parse(&sent).unwrap();
-        let QueryDecision::Forward(query) = parsed.validate_query() else {
+        let QueryDecision::Forward(_query) = parsed.validate_query() else {
             panic!("expected a forwardable query");
         };
         let response = Packet::parse(&as_badcookie(query_with_cookie(Some(&[0x11; 8])))).unwrap();
-        assert!(matches!(
-            query.server_cookie_retry(&sent, &response),
-            ServerCookieRetry::Leave
-        ));
+        assert!(matches!(retry(&parsed, &response), ServerCookieRetry::Tcp));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn response_cookie_lengths_and_local_error_policy() {
+        let mut query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00\x00\x01\x00\x01\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x0c\x00\x0a\x00\x08".to_vec();
+        query.extend_from_slice(&[3; 8]);
+        let packet = Packet::parse(&query).unwrap();
+        for code in [0, 2, 5, 23] {
+            for length in 0..=41 {
+                let mut wire = query.clone();
+                wire[2] = 0x81;
+                wire[3] = 0x80 | (code & 15);
+                wire[22] = code >> 4;
+                wire[26..28].copy_from_slice(&((length + 4) as u16).to_be_bytes());
+                wire[30..32].copy_from_slice(&(length as u16).to_be_bytes());
+                wire.truncate(32);
+                wire.resize(32 + length, 3);
+                let response = Packet::parse(&wire).unwrap();
+                assert_eq!(
+                    valid_response(&packet, &response, true),
+                    (16..=40).contains(&length),
+                    "rcode {code} length {length}"
+                );
+            }
+        }
+        let local = packet
+            .local_error_reply(super::super::ResponseCode::ServerFailure)
+            .unwrap();
+        assert_eq!(&local[local.len() - 2..], &[0, 0]); // Empty fresh OPT, no fake COOKIE.
+        query[27] = 20;
+        query[31] = 16;
+        query.extend_from_slice(&[4; 8]);
+        let packet = Packet::parse(&query).unwrap();
+        assert!(
+            packet
+                .local_error_reply(super::super::ResponseCode::ServerFailure)
+                .is_none()
+        );
+        assert!(
+            packet
+                .local_error_reply(super::super::ResponseCode::FormatError)
+                .is_none()
+        );
     }
 }

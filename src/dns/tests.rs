@@ -45,7 +45,7 @@ fn responses_cannot_be_used_as_validated_queries() {
 
 #[test]
 fn malformed_query_flags_and_missing_question_are_rejected() {
-    for (offset, mask) in [(2, 0x02), (3, 0x40), (3, 0x01)] {
+    for (offset, mask) in [(2, 0x02), (3, 0x01)] {
         let mut wire = QUERY.to_vec();
         wire[offset] |= mask;
         let packet = Packet::parse(&wire).unwrap();
@@ -258,7 +258,9 @@ fn response_correlation_and_safe_truncation() {
     let QueryDecision::Forward(query) = packet.validate_query() else {
         panic!("expected a forwardable query");
     };
-    let bytes = query.truncated_reply(ResponseCode::NoError);
+    let response = Packet::parse(&packet.error_reply(ResponseCode::NoError)).unwrap();
+    let response = query.sent(query.id()).validate_response(response).unwrap();
+    let bytes = query.truncated_reply(&response);
     let reply = Packet::parse(&bytes).unwrap();
     assert!(reply.header.truncated());
     assert!(reply.corresponds_to(&query, query.id()));
@@ -296,4 +298,49 @@ fn deterministic_hostile_corpus_never_panics() {
             let _ = Packet::parse(&bytes);
         }
     }
+}
+
+#[test]
+fn structured_opt_mutations_retain_only_safe_error_context() {
+    for length in [0, 1, 4, 5, 6, 255, 65535] {
+        let mut wire = with_opt(0);
+        let offset = QUERY.len() + 9;
+        wire[offset..offset + 2].copy_from_slice(&(length as u16).to_be_bytes());
+        if length == 5 {
+            assert!(Packet::parse(&wire).is_ok());
+            continue;
+        }
+        let failure = Packet::parse_for_reply(&wire).unwrap_err();
+        let reply = failure.format_reply().unwrap();
+        assert_eq!(&reply[..2], &QUERY[..2]);
+        if length > 5 || (1..5).contains(&length) {
+            assert_eq!(&reply[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]);
+            assert_eq!(
+                &reply[QUERY.len()..],
+                &[0, 0, 41, 4, 208, 0, 0, 128, 0, 0, 0]
+            );
+        } else {
+            assert_eq!(reply.len(), 12);
+        }
+    }
+    // A malformed unsolicited response has no reply context at all.
+    let mut response = with_opt(0);
+    response[2] |= 0x80;
+    response.pop();
+    assert!(
+        Packet::parse_for_reply(&response)
+            .unwrap_err()
+            .format_reply()
+            .is_none()
+    );
+    // Unknown operations can structurally contain several questions. Their
+    // product policy is NOTIMP; RFC 9619's QUERY limit is not applied globally.
+    let mut other = QUERY.to_vec();
+    other[2] = 0x79;
+    other[5] = 2;
+    other.extend_from_slice(&QUERY[12..]);
+    assert_eq!(
+        rejected(&Packet::parse(&other).unwrap()),
+        ResponseCode::NotImplemented
+    );
 }
