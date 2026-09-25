@@ -67,6 +67,14 @@ The default configuration path for the installed binary is
 `/etc/sederial/sederial.toml`. The packaged systemd service can be started with
 `sudo systemctl enable --now sederial` after editing that file.
 
+## Protocol and operational limits
+
+This service is for local or trusted small LAN clients. It forwards ordinary
+single-question DNS queries and DNSSEC data without caching or DNSSEC validation.
+
+See [RFC compliance and limits](RFC-COMPLIANCE.md) for supported RFCs,
+deliberate limits, unsupported features and corresponding regression tests.
+
 ### License
 
 <sup>
