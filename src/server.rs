@@ -58,8 +58,9 @@ impl Server {
     /// Returns socket bind or timeout-configuration errors. If either protocol
     /// fails to initialize, the other socket is dropped before returning.
     pub(crate) fn bind(config: Config) -> io::Result<Self> {
-        let udp = UdpSocket::bind(config.listen)?;
-        let tcp = TcpListener::bind(config.listen)?;
+        let listen = config.listen.socket();
+        let udp = UdpSocket::bind(listen)?;
+        let tcp = TcpListener::bind(listen)?;
         udp.set_read_timeout(Some(IO_POLL))?;
         udp.set_write_timeout(Some(IO_POLL))?;
         Ok(Self {

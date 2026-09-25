@@ -22,7 +22,7 @@ const MAX_ROUTES: usize = 4096;
 /// Startup settings produced by whole-file validation before listeners bind.
 #[derive(Debug)]
 pub(crate) struct Config {
-    pub(crate) listen: SocketAddr,
+    pub(crate) listen: UpstreamAddress,
     pub(crate) routing: RoutingTable,
 }
 impl Config {
@@ -58,9 +58,10 @@ impl Config {
             )
         })?;
         // Listeners share the concrete unicast/nonzero-port restriction with
-        // upstreams. Wildcard binding would require destination-address tracking
-        // to send UDP replies from the address the client originally queried.
-        UpstreamAddress::new(listen)
+        // upstreams, including IPv4-mapped normalization. Wildcard binding would
+        // require destination-address tracking to send UDP replies from the
+        // address the client originally queried.
+        let listen = UpstreamAddress::new(listen)
             .map_err(|error| ConfigError::Invalid(format!("listen: {error}")))?;
         let default_table = table
             .get("default")
@@ -143,7 +144,7 @@ fn reject_unknown_keys(
 /// Preserves configured failover order while validating endpoints and self-loops.
 fn parse_upstream_group(
     table: &Table<'_>,
-    listen: SocketAddr,
+    listen: UpstreamAddress,
 ) -> Result<UpstreamGroup, ConfigError> {
     let values = table
         .get("servers")
@@ -163,12 +164,11 @@ fn parse_upstream_group(
             .map_err(|_| ConfigError::Invalid(format!("invalid upstream address {raw:?}")))?;
         // Compare canonical IPs so an IPv4-mapped spelling cannot hide a direct
         // loop. Loops through other resolvers are outside local validation.
+        let listen = listen.socket();
         if address.port() == listen.port()
             && address.ip().to_canonical() == listen.ip().to_canonical()
         {
-            return Err(ConfigError::Invalid(
-                "upstream points to the listener (forwarding loop)".into(),
-            ));
+            return Err(ConfigError::ForwardingLoop);
         }
         addresses.push(UpstreamAddress::new(address).map_err(ConfigError::Routing)?);
     }
@@ -181,6 +181,7 @@ pub(crate) enum ConfigError {
     Io(io::Error),
     Syntax(toml::de::Error),
     Invalid(String),
+    ForwardingLoop,
     Routing(RouteError),
 }
 impl fmt::Display for ConfigError {
@@ -189,6 +190,9 @@ impl fmt::Display for ConfigError {
             Self::Io(e) => e.fmt(f),
             Self::Syntax(e) => e.fmt(f),
             Self::Invalid(e) => f.write_str(e),
+            Self::ForwardingLoop => {
+                f.write_str("upstream points to the listener (forwarding loop)")
+            }
             Self::Routing(e) => e.fmt(f),
         }
     }
@@ -199,7 +203,7 @@ impl Error for ConfigError {
             Self::Io(e) => Some(e),
             Self::Syntax(e) => Some(e),
             Self::Routing(e) => Some(e),
-            Self::Invalid(_) => None,
+            Self::Invalid(_) | Self::ForwardingLoop => None,
         }
     }
 }
@@ -211,7 +215,7 @@ mod tests {
     #[test]
     fn parses_complete_toml_and_ipv6() {
         let config = Config::parse("listen = '[::1]:5300'\n[default]\nservers = [\n '[::1]:5353', # comment\n]\n[[route]]\ndomain = '_tcp.EXAMPLE.test.'\nservers = ['127.0.0.1:5354']").unwrap();
-        assert!(config.listen.is_ipv6());
+        assert!(config.listen.socket().is_ipv6());
         assert_eq!(config.routing.routes().len(), 1);
     }
     #[test]
@@ -232,7 +236,7 @@ mod tests {
                 "listen='{raw}'\n[default]\nservers=['192.0.2.53']"
             ))
             .unwrap();
-            assert_eq!(config.listen, expected, "listen={raw}");
+            assert_eq!(config.listen.socket(), expected, "listen={raw}");
             let config = Config::parse(&format!(
                 "listen='127.0.0.2:5300'\n[default]\nservers=['{raw}']\n\
                  [[route]]\ndomain='example.test'\nservers=['{raw}']"
@@ -262,9 +266,7 @@ mod tests {
                 ),
             ] {
                 let error = Config::parse(&format!("listen='{listen}'\n{group}")).unwrap_err();
-                assert!(
-                    matches!(error, ConfigError::Invalid(ref text) if text.contains("forwarding loop"))
-                );
+                assert!(matches!(error, ConfigError::ForwardingLoop));
             }
         }
         for servers in [
@@ -283,6 +285,16 @@ mod tests {
                 ConfigError::Routing(RouteError::DuplicateServer)
             ));
         }
+    }
+    #[test]
+    fn listen_keeps_the_canonical_unicast_address() {
+        let config =
+            Config::parse("listen='[::ffff:127.0.0.1]'\n[default]\nservers=['192.0.2.53']\n")
+                .unwrap();
+        assert_eq!(
+            config.listen.socket(),
+            "127.0.0.1:53".parse::<SocketAddr>().unwrap()
+        );
     }
     #[test]
     fn rejects_invalid_config_as_a_whole() {

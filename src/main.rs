@@ -76,11 +76,22 @@ fn run() -> Result<(), String> {
         "default: {} upstream(s)",
         config.routing.default().servers().len()
     ));
-    for route in config.routing.routes() {
+    let routes = config.routing.routes();
+    logging::info(format_args!("{} route(s)", routes.len()));
+    // Lookup order is longest suffix first. Cap the lines so a full split-DNS
+    // file cannot write one journal entry per route.
+    const ROUTE_LOG_LIMIT: usize = 8;
+    for route in routes.iter().take(ROUTE_LOG_LIMIT) {
         logging::info(format_args!(
             "route {}: {} upstream(s)",
             route.suffix,
             route.upstreams.servers().len()
+        ));
+    }
+    if routes.len() > ROUTE_LOG_LIMIT {
+        logging::info(format_args!(
+            "{} additional route(s) omitted from startup log",
+            routes.len() - ROUTE_LOG_LIMIT
         ));
     }
     if check {
