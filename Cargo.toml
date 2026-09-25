@@ -2,8 +2,10 @@
 name = "sederial"
 version = "0.1.0"
 edition = "2024"
-publish = false
+rust-version = "1.98.1"
 description = "A lightweight DNS forwarder for split-DNS environments"
+license = "MIT OR Apache-2.0"
+exclude = ["/docs/**"]
 
 [dependencies]
 toml = { version = "1.1", default-features = false, features = ["parse", "std"] }

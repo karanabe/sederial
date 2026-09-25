@@ -2,6 +2,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -20,6 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate tag
+        if: github.event_name == 'push'
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -35,11 +37,11 @@ jobs:
       - name: Build and package
         env:
           TARGET: ${{ matrix.target }}
-          TAG: ${{ github.ref_name }}
         run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
           cargo build --release --locked --target "$TARGET"
-          scripts/package.sh "${TAG#v}" "$TARGET" "target/$TARGET/release/sederial"
-          python3 scripts/verify-artifacts.py "${TAG#v}" "$TARGET" --native
+          scripts/package.sh "$version" "$TARGET" "target/$TARGET/release/sederial"
+          python3 scripts/verify-artifacts.py "$version" "$TARGET" --native
           python3 tests/standalone_smoke.py "target/$TARGET/release/sederial"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -48,6 +50,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
