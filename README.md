@@ -21,7 +21,7 @@ On Debian or Ubuntu, download the matching `.deb` from the
 install it. For amd64:
 
 ```sh
-sudo apt install ./sederial_0.1.0_amd64.deb
+sudo apt install ./sederial_0.2.0_amd64.deb
 ```
 
 Use the `_arm64.deb` file on arm64. The package installs a systemd service but
