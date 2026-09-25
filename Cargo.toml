@@ -5,7 +5,15 @@ edition = "2024"
 rust-version = "1.98.1"
 description = "A lightweight DNS forwarder for split-DNS environments"
 license = "MIT OR Apache-2.0"
-exclude = ["/docs/**"]
+include = [
+    "/src/**",
+    "/tests/*.rs",
+    "/tests/support/**",
+    "/packaging/sederial.toml",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/README.md",
+]
 
 [dependencies]
 toml = { version = "1.1", default-features = false, features = ["parse", "std"] }
