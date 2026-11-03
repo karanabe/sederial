@@ -28,6 +28,8 @@ with tempfile.TemporaryDirectory(prefix="sederial-artifact-") as temp:
     subprocess.run(["dpkg-deb", "-R", package, root / "deb"], check=True)
     deb = root / "deb"
     assert (deb / "DEBIAN/conffiles").read_text() == "/etc/sederial/sederial.toml\n"
+    assert sorted(path.relative_to(deb).as_posix() for path in deb.rglob("*.toml")) == ["etc/sederial/sederial.toml"]
+    assert (deb / "etc/sederial/sederial.toml").read_bytes() == Path("packaging/sederial.toml").read_bytes()
     for path in ["usr/bin/sederial", "etc/sederial/sederial.toml", "usr/lib/systemd/system/sederial.service",
                  "usr/share/doc/sederial/README.md"]:
         assert (deb / path).is_file(), path
@@ -39,6 +41,8 @@ with tempfile.TemporaryDirectory(prefix="sederial-artifact-") as temp:
         tar.extractall(root / "tar", filter="data")
     assert (root / "tar/sederial").read_bytes() == (deb / "usr/bin/sederial").read_bytes()
     assert (root / "tar/README.md").is_file()
+    assert sorted(path.relative_to(root / "tar").as_posix() for path in (root / "tar").rglob("*.toml")) == ["sederial.toml"]
+    assert (root / "tar/sederial.toml").read_bytes() == (deb / "etc/sederial/sederial.toml").read_bytes()
     expected = collect(args.target)
     for directory in [deb / "usr/share/doc/sederial", root / "tar"]:
         for name, original in expected.items():

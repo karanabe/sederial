@@ -1,90 +1,61 @@
-<br />
-<h1 align="center">Sederial</h1>
-<h3 align="center">A lightweight DNS forwarder for split-DNS environments. Route internal domains to private DNS servers and everything else to your default upstream.</h3>
-<br />
-<br />
+# Sederial
 
-Sederial is a lightweight DNS forwarder for split-DNS networks on Linux. It
-forwards UDP and TCP queries to different DNS servers by domain suffix. The
-most specific matching route wins; other queries use the default servers.
+A lightweight DNS forwarder and local A-record responder for Linux.
+Supports UDP/TCP, domain-based forwarding, and operation without upstream DNS.
 
 ## Install
-
-With Cargo:
 
 ```sh
 cargo install sederial --locked
 ```
 
-On Debian or Ubuntu, download the matching `.deb` from the
-[GitHub releases](https://github.com/karanabe/sederial/releases/latest), then
-install it. For amd64:
+For Debian/Ubuntu, download the `.deb` for your architecture from
+[GitHub Releases](https://github.com/karanabe/sederial/releases/latest):
 
 ```sh
-sudo apt install ./sederial_0.2.0_amd64.deb
+sudo apt install ./sederial_0.3.0_amd64.deb
 ```
 
-Use the `_arm64.deb` file on arm64. The package installs a systemd service but
-leaves it stopped until you configure and enable it.
+Use `_arm64.deb` on arm64. The service stays stopped until configured and enabled.
 
-## Configure
+## Configure and run
 
-Create `sederial.toml`:
+Create `/etc/sederial/sederial.toml` using the commented
+[configuration example](packaging/sederial.toml), or edit the file installed by
+the Debian package.
 
-```toml
-listen = "127.0.0.1:5300"
+Use `[[route]]` for domain-based forwarding and `[[local]]` for local A records.
+The most specific matching domain wins, including its subdomains. Omit
+`[default]` for operation without a default upstream. Local names without data
+for the requested type return NODATA; unmatched names without an upstream return
+NXDOMAIN.
 
-[default]
-servers = ["1.1.1.1", "1.0.0.1"]
-
-[[route]]
-domain = "example.test"
-servers = ["192.168.100.10"]
-```
-
-This sends queries for `example.test` and its subdomains to `192.168.100.10`.
-IP addresses without a port use port 53. Choose a listener address reachable by
-your clients and restrict access to trusted networks; Sederial has no client
-access control.
-
-## Run
-
-Rust 1.98.1 is specified in `rust-toolchain.toml`. To validate the configuration
-and start a local instance:
+For the Debian package, validate the configuration and enable the service:
 
 ```sh
-cargo run --locked -- --config ./sederial.toml --check
-cargo run --locked -- --config ./sederial.toml
+sederial --check
+sudo systemctl enable --now sederial
 ```
 
-Query it with `dig -p 5300 @127.0.0.1 host.example.test`. Stop the process with
-Ctrl+C. To run the tests, use `cargo test --locked`.
+For a foreground process with a custom configuration:
 
-After `cargo install`, replace `cargo run --locked --` with `sederial` in the
-commands above.
+```sh
+sederial --config ./sederial.toml
+```
 
-The default configuration path for the installed binary is
-`/etc/sederial/sederial.toml`. The packaged systemd service can be started with
-`sudo systemctl enable --now sederial` after editing that file.
+Restrict access to trusted clients. There is no ACL, response cache, or DNSSEC
+validation. See [protocol support and limits](RFC-COMPLIANCE.md).
 
-## Protocol and operational limits
+## Development
 
-This service is for local or trusted small LAN clients. It forwards ordinary
-single-question DNS queries and DNSSEC data without caching or DNSSEC validation.
+Rust 1.98.1 is pinned in `rust-toolchain.toml`.
 
-See [RFC compliance and limits](RFC-COMPLIANCE.md) for supported RFCs,
-deliberate limits, unsupported features and corresponding regression tests.
+```sh
+cargo test --locked
+cargo build --release --locked
+```
 
-### License
+## License
 
-<sup>
-Licensed under either of <a href="LICENSE-APACHE">Apache License, Version 2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
-</sup>
-
-<br>
-
-<sub>
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
-</sub>
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). Contributions are licensed
+under the same terms unless explicitly stated otherwise.

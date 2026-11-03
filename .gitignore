@@ -1,6 +1,7 @@
 /target/
 /dist/
 /plans/
+/docs/
 *.deb
 
 __pycache__/
