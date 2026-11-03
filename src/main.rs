@@ -81,7 +81,14 @@ fn run() -> Result<(), String> {
     logging::info(format_args!("configuration loaded from {}", path.display()));
     logging::info(format_args!(
         "default: {} upstream(s)",
-        config.routing.default().servers().len()
+        config
+            .routing
+            .default()
+            .map_or(0, |group| group.servers().len())
+    ));
+    logging::info(format_args!(
+        "{} local record(s)",
+        config.routing.local().len()
     ));
     let routes = config.routing.routes();
     logging::info(format_args!("{} route(s)", routes.len()));

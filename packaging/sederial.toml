@@ -2,6 +2,9 @@
 # Ports default to 53. Override with IP:port or [IPv6]:port, e.g. 127.0.0.1:5300.
 listen = "127.0.0.1"
 
+# Optional fallback for names with no matching local or forwarding rule.
+# For standalone local DNS, remove [default] and its servers line entirely.
+# An empty servers array is invalid. No system resolver is used when omitted.
 [default]
 servers = ["1.1.1.1", "1.0.0.1"]
 
@@ -9,7 +12,24 @@ servers = ["1.1.1.1", "1.0.0.1"]
 # [[route]]
 # domain = "ad.lab.example.test"
 # servers = ["192.168.100.10"]
-#
+
 # [[route]]
 # domain = "100.168.192.in-addr.arpa"
 # servers = ["192.168.100.10"]
+
+# Local A answers: uncomment this block to answer lab.test and its subdomains.
+# For networking-lab 05/07, also set listen = "10.77.20.2" above and remove
+# [default] and its servers line; run inside the nl-s network namespace.
+# [[local]]
+# domain = "lab.test"
+# address = "10.77.20.2"
+# TTL is optional: 0 (the default) disables caching; maximum 2147483647 seconds.
+# ttl = 0
+
+# Local and forwarding rules share longest-label-suffix matching, ignoring
+# ASCII case and a trailing dot. Duplicate domains across rules are invalid.
+# A local rule answers IN A/ANY with one A record. Other ordinary types return
+# NODATA (NOERROR, no answers); non-IN classes are refused. No type falls back
+# to upstreams. Names with no rule or default upstream receive NXDOMAIN.
+# Local replies do not claim authority or DNSSEC validation (AA/AD clear).
+# RA is clear without upstreams; negative replies have no SOA/cache TTL.

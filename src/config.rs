@@ -3,7 +3,9 @@
 //! This is the only TOML boundary. Runtime modules receive domain values rather
 //! than configuration tables, and startup fails if any route is invalid.
 
-use crate::routing::{Route, RouteError, RoutingTable, UpstreamAddress, UpstreamGroup};
+use crate::routing::{
+    LocalRecord, Route, RouteError, RoutingTable, UpstreamAddress, UpstreamGroup,
+};
 use std::{
     error::Error,
     fmt,
@@ -50,7 +52,11 @@ impl Config {
         let table = Table::parse(text)
             .map_err(ConfigError::Syntax)?
             .into_inner();
-        reject_unknown_keys(&table, &["listen", "default", "route"], "configuration")?;
+        reject_unknown_keys(
+            &table,
+            &["listen", "default", "route", "local"],
+            "configuration",
+        )?;
         let listen = parse_address(required_string(&table, "listen")?).map_err(|_| {
             ConfigError::Invalid(
                 "listen must be an IP address with an optional port (IPv6 with port: [address]:port)"
@@ -64,12 +70,17 @@ impl Config {
         let listen = UpstreamAddress::new(listen)
             .map_err(|error| ConfigError::Invalid(format!("listen: {error}")))?
             .socket();
-        let default_table = table
+        let default = table
             .get("default")
-            .and_then(|v| v.get_ref().as_table())
-            .ok_or_else(|| ConfigError::Invalid("missing [default] table".into()))?;
-        reject_unknown_keys(default_table, &["servers"], "default")?;
-        let default = parse_upstream_group(default_table, listen)?;
+            .map(|value| {
+                let default_table = value
+                    .get_ref()
+                    .as_table()
+                    .ok_or_else(|| ConfigError::Invalid("default must be a table".into()))?;
+                reject_unknown_keys(default_table, &["servers"], "default")?;
+                parse_upstream_group(default_table, listen)
+            })
+            .transpose()?;
         let mut routes = Vec::new();
         if let Some(value) = table.get("route") {
             let array = value
@@ -101,9 +112,53 @@ impl Config {
                 });
             }
         }
+        let mut local = Vec::new();
+        if let Some(value) = table.get("local") {
+            let array = value
+                .get_ref()
+                .as_array()
+                .ok_or_else(|| ConfigError::Invalid("local must be an array of tables".into()))?;
+            if routes.len() + array.len() > MAX_ROUTES {
+                return Err(ConfigError::Invalid(format!(
+                    "at most {MAX_ROUTES} route and local entries are supported"
+                )));
+            }
+            for (index, value) in array.iter().enumerate() {
+                let context = format!("local {index}");
+                let record = value
+                    .get_ref()
+                    .as_table()
+                    .ok_or_else(|| ConfigError::Invalid(format!("{context}: expected a table")))?;
+                reject_unknown_keys(record, &["domain", "address", "ttl"], &context)?;
+                let suffix = required_string(record, "domain")?
+                    .parse()
+                    .map_err(|error| ConfigError::Invalid(format!("{context} domain: {error}")))?;
+                let address = required_string(record, "address")?.parse().map_err(|_| {
+                    ConfigError::Invalid(format!("{context} address: expected an IPv4 address"))
+                })?;
+                let ttl = match record.get("ttl") {
+                    None => 0,
+                    Some(value) => value
+                        .get_ref()
+                        .as_integer()
+                        .and_then(|ttl| i32::from_str_radix(ttl.as_str(), ttl.radix()).ok())
+                        .filter(|ttl| *ttl >= 0)
+                        .ok_or_else(|| {
+                            ConfigError::Invalid(format!(
+                                "{context} ttl: expected an integer in 0..=2147483647"
+                            ))
+                        })? as u32,
+                };
+                local.push(LocalRecord {
+                    suffix,
+                    address,
+                    ttl,
+                });
+            }
+        }
         Ok(Self {
             listen,
-            routing: RoutingTable::new(default, routes).map_err(ConfigError::Routing)?,
+            routing: RoutingTable::new(default, routes, local).map_err(ConfigError::Routing)?,
         })
     }
 }
@@ -213,6 +268,87 @@ mod tests {
     use super::*;
     const VALID: &str = "listen='127.0.0.1:5300'\n[default]\nservers=['1.1.1.1:53']\n";
     #[test]
+    fn optional_default_and_local_records() {
+        let config = Config::parse("listen='127.0.0.1:5300'").unwrap();
+        assert!(!config.routing.has_upstreams());
+        let local = "[[local]]\ndomain='LAB.test.'\naddress='10.77.20.2'\n";
+        let config = Config::parse(&format!("listen='127.0.0.1:5300'\n{local}")).unwrap();
+        assert!(config.routing.default().is_none());
+        assert_eq!(config.routing.local()[0].address.octets(), [10, 77, 20, 2]);
+        assert_eq!(config.routing.local()[0].ttl, 0);
+        for ttl in ["60", "0", "2147483647", "0x7fff_ffff", "+60"] {
+            assert!(Config::parse(&format!("{VALID}{local}ttl={ttl}")).is_ok());
+        }
+        let config = Config::parse(
+            "listen='127.0.0.1:5300'\n[[route]]\ndomain='private.test'\nservers=['192.0.2.53']",
+        )
+        .unwrap();
+        assert!(config.routing.has_upstreams());
+        assert!(config.routing.default().is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_local_settings_and_ambiguous_suffixes() {
+        for settings in [
+            "default=42",
+            "[default]",
+            "[default]\nservers=[]",
+            "local=42",
+            "[local]\ndomain='lab.test'",
+            "local=[1]",
+            "[[local]]\ndomain='lab.test'",
+            "[[local]]\naddress='10.77.20.2'",
+            "[[local]]\ndomain='*.lab.test'\naddress='10.77.20.2'",
+            "[[local]]\ndomain='lab.test'\naddress='::1'",
+            "[[local]]\ndomain='lab.test'\naddress='localhost'",
+            "[[local]]\ndomain='lab.test'\naddress='10.77.20.2:53'",
+            "[[local]]\ndomain='lab.test'\naddress=42",
+            "[[local]]\ndomain='lab.test'\naddress='10.77.20.2'\nunknown=true",
+            "[[local]]\ndomain='lab.test'\naddress='10.77.20.2'\n[[local]]\ndomain='LAB.TEST.'\naddress='10.77.20.3'",
+            "[[local]]\ndomain='lab.test'\naddress='10.77.20.2'\n[[route]]\ndomain='LAB.TEST.'\nservers=['192.0.2.53']",
+        ] {
+            assert!(
+                Config::parse(&format!("listen='127.0.0.1:5300'\n{settings}")).is_err(),
+                "{settings}"
+            );
+        }
+        for ttl in [
+            "-1",
+            "2147483648",
+            "999999999999999999999999",
+            "1.5",
+            "'60'",
+            "true",
+        ] {
+            assert!(
+                Config::parse(&format!(
+                    "{VALID}[[local]]\ndomain='lab.test'\naddress='10.77.20.2'\nttl={ttl}"
+                ))
+                .is_err(),
+                "{ttl}"
+            );
+        }
+        let mut settings = String::from("listen='127.0.0.1:5300'\n");
+        for index in 0..MAX_ROUTES {
+            settings.push_str(&format!(
+                "[[local]]\ndomain='d{index}.test'\naddress='10.77.20.2'\n"
+            ));
+        }
+        assert!(Config::parse(&settings).is_ok());
+        assert!(
+            Config::parse(&format!(
+                "{settings}[[route]]\ndomain='other.test'\nservers=['192.0.2.53']"
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::parse(&format!(
+                "{settings}[[local]]\ndomain='other.test'\naddress='10.77.20.2'"
+            ))
+            .is_err()
+        );
+    }
+    #[test]
     fn parses_complete_toml_and_ipv6() {
         let config = Config::parse("listen = '[::1]:5300'\n[default]\nservers = [\n '[::1]:5353', # comment\n]\n[[route]]\ndomain = '_tcp.EXAMPLE.test.'\nservers = ['127.0.0.1:5354']").unwrap();
         assert!(config.listen.is_ipv6());
@@ -242,7 +378,10 @@ mod tests {
                  [[route]]\ndomain='example.test'\nservers=['{raw}']"
             ))
             .unwrap();
-            assert_eq!(config.routing.default().servers()[0].socket(), expected);
+            assert_eq!(
+                config.routing.default().unwrap().servers()[0].socket(),
+                expected
+            );
             assert_eq!(
                 config.routing.routes()[0].upstreams.servers()[0].socket(),
                 expected

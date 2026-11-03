@@ -1,10 +1,14 @@
-//! Validated upstream groups and pure longest-label-suffix selection.
+//! Validated upstream groups, local A policy and longest-label-suffix selection.
 //!
 //! Routing depends only on the question name. Record types, network failures
-//! and upstream health do not change which group is eligible for a query.
+//! and upstream health do not change which local rule or group is eligible.
 
 use crate::dns::DomainName;
-use std::{error::Error, fmt, net::SocketAddr};
+use std::{
+    error::Error,
+    fmt,
+    net::{Ipv4Addr, SocketAddr},
+};
 
 pub(crate) const MAX_UPSTREAMS: usize = 8;
 
@@ -75,33 +79,40 @@ pub(crate) struct Route {
     pub(crate) upstreams: UpstreamGroup,
 }
 
+/// A local IN A answer for a suffix and every name below it.
+#[derive(Debug)]
+pub(crate) struct LocalRecord {
+    pub(crate) suffix: DomainName,
+    pub(crate) address: Ipv4Addr,
+    pub(crate) ttl: u32,
+}
+
 /// Immutable policy with unique suffixes ordered from most to least specific.
 #[derive(Debug)]
 pub(crate) struct RoutingTable {
-    default: UpstreamGroup,
+    default: Option<UpstreamGroup>,
     routes: Vec<Route>,
+    local: Vec<LocalRecord>,
 }
 /// A borrowed route decision, retaining whether an explicit suffix matched.
 pub(crate) enum Selection<'a> {
     Default(&'a UpstreamGroup),
     Routed(&'a Route),
-}
-impl Selection<'_> {
-    /// Returns the only group eligible for this query, including during failover.
-    pub(crate) fn upstreams(&self) -> &UpstreamGroup {
-        match self {
-            Self::Default(group) => group,
-            Self::Routed(route) => &route.upstreams,
-        }
-    }
+    Local(&'a LocalRecord),
+    Unmatched,
 }
 impl RoutingTable {
     /// Rejects duplicate suffixes and prepares longest-suffix lookup order.
     ///
     /// # Errors
     /// Returns [`RouteError::DuplicateRoute`] for equivalent domain names,
-    /// including differences only in ASCII case or a trailing presentation dot.
-    pub(crate) fn new(default: UpstreamGroup, mut routes: Vec<Route>) -> Result<Self, RouteError> {
+    /// including differences only in ASCII case or a trailing presentation dot,
+    /// and collisions between local and forwarding rules.
+    pub(crate) fn new(
+        default: Option<UpstreamGroup>,
+        mut routes: Vec<Route>,
+        mut local: Vec<LocalRecord>,
+    ) -> Result<Self, RouteError> {
         for (i, route) in routes.iter().enumerate() {
             if routes[..i]
                 .iter()
@@ -110,27 +121,66 @@ impl RoutingTable {
                 return Err(RouteError::DuplicateRoute(route.suffix.clone()));
             }
         }
+        for (i, record) in local.iter().enumerate() {
+            if local[..i]
+                .iter()
+                .any(|previous| previous.suffix == record.suffix)
+                || routes.iter().any(|route| route.suffix == record.suffix)
+            {
+                return Err(RouteError::DuplicateRoute(record.suffix.clone()));
+            }
+        }
         // With complete-label matching, specificity is the number of labels,
         // not the number of bytes. The first matching route is then sufficient.
         routes.sort_by_key(|route| std::cmp::Reverse(route.suffix.label_count()));
-        Ok(Self { default, routes })
+        local.sort_by_key(|record| std::cmp::Reverse(record.suffix.label_count()));
+        Ok(Self {
+            default,
+            routes,
+            local,
+        })
     }
     /// Selects the longest suffix, or the default only when no suffix matches.
     ///
     /// Exhausting a routed group never authorizes use of the default group;
     /// otherwise private names could leak to a public resolver during outages.
+    /// Local rules also never fall back by record type. No match and no default
+    /// yields `Unmatched`, allowing a local negative response without I/O.
     pub(crate) fn select(&self, name: &DomainName) -> Selection<'_> {
-        self.routes
+        let route = self
+            .routes
             .iter()
-            .find(|route| name.is_subdomain_of(&route.suffix))
-            .map_or(Selection::Default(&self.default), Selection::Routed)
+            .find(|route| name.is_subdomain_of(&route.suffix));
+        let local = self
+            .local
+            .iter()
+            .find(|record| name.is_subdomain_of(&record.suffix));
+        match (route, local) {
+            (Some(route), Some(record))
+                if route.suffix.label_count() > record.suffix.label_count() =>
+            {
+                Selection::Routed(route)
+            }
+            (_, Some(record)) => Selection::Local(record),
+            (Some(route), None) => Selection::Routed(route),
+            (None, None) => self
+                .default
+                .as_ref()
+                .map_or(Selection::Unmatched, Selection::Default),
+        }
     }
     /// Returns explicit routes in lookup order, rather than configuration order.
     pub(crate) fn routes(&self) -> &[Route] {
         &self.routes
     }
-    pub(crate) fn default(&self) -> &UpstreamGroup {
-        &self.default
+    pub(crate) fn default(&self) -> Option<&UpstreamGroup> {
+        self.default.as_ref()
+    }
+    pub(crate) fn local(&self) -> &[LocalRecord] {
+        &self.local
+    }
+    pub(crate) fn has_upstreams(&self) -> bool {
+        self.default.is_some() || !self.routes.is_empty()
     }
 }
 
@@ -182,7 +232,7 @@ mod tests {
             upstreams: group(100 + i as u16),
         })
         .collect();
-        let table = RoutingTable::new(group(53), routes).unwrap();
+        let table = RoutingTable::new(Some(group(53)), routes, vec![]).unwrap();
         for (name, port) in [
             ("ad.lab.exceeds.test", 101),
             ("HOST.AD.LAB.EXCEEDS.TEST.", 101),
@@ -195,23 +245,23 @@ mod tests {
             ("1.100.168.192.in-addr.arpa", 103),
             (".", 53),
         ] {
-            assert_eq!(
-                table.select(&name.parse().unwrap()).upstreams().servers()[0]
-                    .socket()
-                    .port(),
-                port,
-                "{name}"
-            );
+            let group = match table.select(&name.parse().unwrap()) {
+                Selection::Default(group) => group,
+                Selection::Routed(route) => &route.upstreams,
+                _ => panic!("expected forwarding"),
+            };
+            assert_eq!(group.servers()[0].socket().port(), port, "{name}");
         }
     }
     #[test]
     fn root_route_and_duplicate_normalization() {
         let table = RoutingTable::new(
-            group(53),
+            Some(group(53)),
             vec![Route {
                 suffix: ".".parse().unwrap(),
                 upstreams: group(54),
             }],
+            vec![],
         )
         .unwrap();
         assert!(matches!(
@@ -220,7 +270,7 @@ mod tests {
         ));
         assert!(
             RoutingTable::new(
-                group(53),
+                Some(group(53)),
                 vec![
                     Route {
                         suffix: "EXAMPLE.COM".parse().unwrap(),
@@ -230,7 +280,8 @@ mod tests {
                         suffix: "example.com.".parse().unwrap(),
                         upstreams: group(55)
                     }
-                ]
+                ],
+                vec![],
             )
             .is_err()
         );

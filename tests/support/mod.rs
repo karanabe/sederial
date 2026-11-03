@@ -151,8 +151,23 @@ impl Daemon {
         Self::start_on("127.0.0.1:0", default, routes)
     }
     pub fn start_on(bind: &str, default: &[SocketAddr], routes: &[(&str, SocketAddr)]) -> Self {
+        let servers = default
+            .iter()
+            .map(|a| format!("'{a}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut settings = format!("[default]\nservers=[{servers}]\n");
+        for (name, upstream) in routes {
+            settings.push_str(&format!(
+                "[[route]]\ndomain='{name}'\nservers=['{upstream}']\n"
+            ));
+        }
+        Self::start_config(bind, &settings)
+    }
+    /// Starts with arbitrary settings; the listener is reserved by the harness.
+    pub fn start_config(bind: &str, settings: &str) -> Self {
         for attempt in 0..START_ATTEMPTS {
-            match Self::start_once(bind, default, routes) {
+            match Self::start_once(bind, settings) {
                 Ok(daemon) => return daemon,
                 // Another test can claim the chosen port after its reservation
                 // is released but before the child binds both listeners.
@@ -167,11 +182,7 @@ impl Daemon {
         }
         unreachable!()
     }
-    fn start_once(
-        bind: &str,
-        default: &[SocketAddr],
-        routes: &[(&str, SocketAddr)],
-    ) -> Result<Self, String> {
+    fn start_once(bind: &str, settings: &str) -> Result<Self, String> {
         let reservation = reserve_endpoint(bind);
         let address = reservation.0.local_addr().unwrap();
         let directory = std::env::temp_dir().join(format!(
@@ -181,17 +192,7 @@ impl Daemon {
         ));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("sederial.toml");
-        let servers = default
-            .iter()
-            .map(|a| format!("'{a}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut text = format!("listen='{address}'\n[default]\nservers=[{servers}]\n");
-        for (name, upstream) in routes {
-            text.push_str(&format!(
-                "[[route]]\ndomain='{name}'\nservers=['{upstream}']\n"
-            ));
-        }
+        let text = format!("listen='{address}'\n{settings}");
         fs::write(&path, text).unwrap();
         drop(reservation);
         let mut child = Command::new(env!("CARGO_BIN_EXE_sederial"))

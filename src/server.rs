@@ -415,11 +415,12 @@ mod admission_tests {
                 .unwrap()
         };
         let routing = RoutingTable::new(
-            group(&public),
+            Some(group(&public)),
             vec![Route {
                 suffix: "private.test".parse().unwrap(),
                 upstreams: group(&private),
             }],
+            vec![],
         )
         .unwrap();
         let stop = Arc::new(AtomicBool::new(false));

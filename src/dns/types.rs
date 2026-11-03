@@ -112,6 +112,7 @@ pub(crate) enum RecordType {
     Tsig,
     Ixfr,
     Axfr,
+    Any,
     Unknown(u16),
 }
 impl RecordType {
@@ -132,6 +133,7 @@ impl RecordType {
             250 => Self::Tsig,
             251 => Self::Ixfr,
             252 => Self::Axfr,
+            255 => Self::Any,
             n => Self::Unknown(n),
         }
     }
@@ -152,6 +154,7 @@ impl RecordType {
             Self::Tsig => 250,
             Self::Ixfr => 251,
             Self::Axfr => 252,
+            Self::Any => 255,
             Self::Unknown(n) => n,
         }
     }

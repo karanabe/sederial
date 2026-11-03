@@ -23,6 +23,43 @@ fn rejected(packet: &Packet) -> ResponseCode {
 const QUERY: &[u8] = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01";
 
 #[test]
+fn local_a_replies_preserve_cookie_suppression_and_parse_as_complete_answers() {
+    for cookie_length in [0_u16, 8, 16, 40] {
+        let mut wire = QUERY.to_vec();
+        wire[11] = 1;
+        wire.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0]);
+        wire.extend_from_slice(
+            &(if cookie_length == 0 {
+                0
+            } else {
+                4 + cookie_length
+            })
+            .to_be_bytes(),
+        );
+        if cookie_length > 0 {
+            wire.extend_from_slice(&10_u16.to_be_bytes());
+            wire.extend_from_slice(&cookie_length.to_be_bytes());
+            wire.resize(wire.len() + usize::from(cookie_length), 42);
+        }
+        let packet = Packet::parse(&wire).unwrap();
+        let QueryDecision::Forward(query) = packet.validate_query() else {
+            panic!("valid local query")
+        };
+        let reply = query.local_a_reply([10, 77, 20, 2].into(), 60);
+        if cookie_length > 8 {
+            assert!(reply.is_none());
+        } else {
+            let reply = Packet::parse(&reply.unwrap()).unwrap();
+            assert_eq!(reply.response_code(), ResponseCode::NoError);
+            assert_eq!(reply.header.counts.answers, 1);
+            assert_eq!(reply.header.counts.additionals, 1);
+            assert!(reply.corresponds_to(&query, query.id()));
+            assert!(reply.cookie.is_none());
+        }
+    }
+}
+
+#[test]
 fn header_and_question_vector() {
     let packet = Packet::parse(QUERY).unwrap();
     assert_eq!(packet.header.id, TransactionId(0x1234));

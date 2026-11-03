@@ -1,4 +1,4 @@
-//! Coordinates client validation, route selection and upstream exchange.
+//! Coordinates client validation, local answers, route selection and exchange.
 //!
 //! Both client transports use this path. Socket framing belongs to `server`
 //! and `transport`; this module returns a complete DNS message or a decision
@@ -6,7 +6,7 @@
 use crate::{
     dns::{Header, MessageType, Packet, QueryDecision, ResponseCode},
     logging,
-    routing::RoutingTable,
+    routing::{RoutingTable, Selection},
     transport::{Deadline, Transport},
     upstream::{ForwardError, Forwarder},
 };
@@ -51,6 +51,21 @@ impl RequestHandler {
         transport: Transport,
         deadline: Deadline,
     ) -> Option<Vec<u8>> {
+        let reply = self.respond_inner(wire, transport, deadline)?;
+        deadline.remaining(&self.stop).ok()?;
+        Some(if self.routing.has_upstreams() {
+            reply
+        } else {
+            crate::dns::without_recursion(reply)
+        })
+    }
+
+    fn respond_inner(
+        &mut self,
+        wire: &[u8],
+        transport: Transport,
+        deadline: Deadline,
+    ) -> Option<Vec<u8>> {
         // Expired queued jobs and cancellation are silent, with no parsing or I/O.
         deadline.remaining(&self.stop).ok()?;
         let header = match Header::parse(wire) {
@@ -85,7 +100,12 @@ impl RequestHandler {
             QueryDecision::Ignore => return None,
         };
         let selection = self.routing.select(query.name());
-        let upstreams = selection.upstreams();
+        let upstreams = match selection {
+            Selection::Local(record) => return query.local_a_reply(record.address, record.ttl),
+            Selection::Unmatched => return query.error_reply(ResponseCode::NameError),
+            Selection::Default(group) => group,
+            Selection::Routed(route) => &route.upstreams,
+        };
         let response = match self
             .forwarder
             .forward(&query, upstreams, transport, &self.stop, deadline)

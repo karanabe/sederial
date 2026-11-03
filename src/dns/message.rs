@@ -262,6 +262,10 @@ pub(crate) struct Query<'a> {
 }
 
 impl Query<'_> {
+    pub(crate) fn local_a_reply(&self, address: std::net::Ipv4Addr, ttl: u32) -> Option<Vec<u8>> {
+        self.packet.local_a_reply(address, ttl)
+    }
+
     pub(crate) fn name(&self) -> &DomainName {
         &self.question.name
     }

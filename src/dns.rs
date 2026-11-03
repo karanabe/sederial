@@ -18,6 +18,7 @@ pub(crate) use cookie::ServerCookieRetry;
 pub(crate) use error::ParseError;
 pub(crate) use message::{Header, Packet, Query, QueryDecision, Response, SentQuery};
 pub(crate) use name::DomainName;
+pub(crate) use reply::without_recursion;
 pub(crate) use types::{MessageType, ResponseCode, TransactionId};
 
 /// Fixed DNS header size, excluding a TCP frame's two-byte length prefix.
